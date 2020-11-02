@@ -1,0 +1,15 @@
+{
+  "test": ".*.ts",
+  "jsc": {
+    "parser": {
+      "syntax": "typescript",
+      "tsx": false,
+      "decorators": false,
+      "dynamicImport": true
+    }
+  },
+  "module": {
+    "type": "commonjs",
+    "lazy": true
+  }
+}
