@@ -5,11 +5,12 @@
   "author": "Seph Gentle <me@josephg.com>",
   "license": "MIT",
   "scripts": {
-    "build": "swc src -d dist",
-    "watch": "swc src -d dist -w",
+    "build": "tsc",
+    "watch": "tsc -w",
     "start": "node --enable-source-maps --unhandled-rejections=strict dist/main.js"
   },
   "dependencies": {
+    "@types/fresh": "^0.5.0",
     "body-parser": "^1.19.0",
     "compression": "^1.7.4",
     "fdb-tuple": "^1.0.0",
@@ -20,8 +21,6 @@
     "sirv": "^1.0.7"
   },
   "devDependencies": {
-    "@swc/cli": "^0.1.27",
-    "@swc/core": "^1.2.37",
     "@types/node": "^14.14.6",
     "@types/polka": "^0.5.1",
     "chokidar": "^3.4.3",

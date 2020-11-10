@@ -1,11 +1,12 @@
 import polka from 'polka'
 import {open} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
-import { getOrCreateAgentId, newAgentName } from './agent'
-import {SchemaInfo, RawValue, LocalVersion, NULL_VALUE} from './types'
+import { getAgentHash, getOrCreateAgentId, localToRemoteVersion, newAgentName } from './agent'
+import {SchemaInfo, RawValue, LocalVersion, NULL_VALUE, RemoteVersion} from './types'
 import bodyParser from 'body-parser'
 import { ServerResponse } from 'http'
 import {keyInc, getLastKey} from './util'
+import fresh from 'fresh'
 
 const PORT = process.env.PORT || 4040
 
@@ -149,6 +150,10 @@ app.use('/raw', (req, res, next) => {
   next()
 })
 
+const encodeVersion = (version: RemoteVersion): string => (
+  pack([version.agentHash, version.seq]).toString('base64')
+)
+
 app.get('/raw/*', (req, res) => {
   const parts = (req as any).parts
   console.log('get parts', parts)
@@ -156,14 +161,20 @@ app.get('/raw/*', (req, res) => {
   console.log('data', data)
   if (data == null) return notFound(res)
 
-  res.setHeader('content-type', 'application/json')
-  // res.setHeader('etag', 'application/json')
-
-  // TODO: Convert agent to hash.
-  res.setHeader('x-version', JSON.stringify([data.version.agent, data.version.seq]))
-  res.write(JSON.stringify(data))
-  // res.write(JSON.stringify(data.value))
-  res.end()
+  const remoteVersion = localToRemoteVersion(db, data.version)
+  const resHeaders = {
+    'content-type': 'application/json',
+    etag: encodeVersion(remoteVersion),
+    'x-version': encodeVersion(remoteVersion),
+  }
+  if (fresh(req.headers, resHeaders)) {
+    res.writeHead(304, resHeaders)
+    res.end()
+  } else {
+    res.writeHead(200, resHeaders)
+    // res.write(JSON.stringify(data.value))
+    res.end(JSON.stringify(data))
+  }
 })
 
 app.put('/raw/*', bodyParser.json(), async (req, res) => {
@@ -178,12 +189,13 @@ app.put('/raw/*', bodyParser.json(), async (req, res) => {
   const versionP = putDb(parts, req.body)
   if (versionP == null) return notFound(res)
 
-  const version = await versionP
-  res.setHeader('x-version', JSON.stringify([version.agent, version.seq]))
+  const localVersion = await versionP
+  const remoteVersion = localToRemoteVersion(db, localVersion)
+  res.setHeader('x-version', encodeVersion(remoteVersion))
   
   // TEMPORARY.
   res.setHeader('content-type', 'application/json')
-  res.write(JSON.stringify(version))
+  res.write(JSON.stringify(remoteVersion))
   
   res.end()
 })
