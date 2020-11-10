@@ -9,7 +9,12 @@ export interface LocalVersion {
   seq: number
 }
 
-export interface RawValue {
+export interface RemoteValue {
+  version: RemoteVersion
+  value: any,
+}
+
+export interface LocalValue {
   version: LocalVersion // Operation which last modified this key
   value: any,
 }
@@ -23,7 +28,7 @@ export const ROOT_VERSION: LocalVersion = {
   agent: 0, seq: 0
 }
 
-export const NULL_VALUE: RawValue = {
+export const NULL_VALUE: LocalValue = {
   version: ROOT_VERSION, value: null
 }
 

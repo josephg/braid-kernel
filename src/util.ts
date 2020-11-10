@@ -2,6 +2,7 @@
 
 import { TupleItem, unpack } from "fdb-tuple";
 import { Database } from "lmdb-store";
+import { LocalVersion, ROOT_VERSION } from "./types";
 
 // Stolen from node-foundationdb.
 export const keyInc = (val: string | Buffer): Buffer => {
@@ -35,4 +36,16 @@ export const getLastKey = (db: Database, prefix: Buffer): TupleItem[] | null => 
   // console.log('prefix', prefix, 'entry', entry)
 
   return entry ? unpack(entry) : null
+}
+
+const ROOT_AGENT = ROOT_VERSION.agent
+export const cmpVersions = (_db: Database, a: LocalVersion, b: LocalVersion): number => {
+  if (a.agent !== ROOT_AGENT && b.agent !== ROOT_AGENT && a.agent !== b.agent) {
+    throw Error('Not implemented')
+  }
+
+  return a.agent === b.agent ? a.seq - b.seq
+    : a.agent === ROOT_AGENT ? -1
+    : b.agent === ROOT_AGENT ? 1
+    : 0 // Unreachable.
 }

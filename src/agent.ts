@@ -2,7 +2,7 @@ import crypto from 'crypto'
 import {getLastKey} from './util'
 import {Database} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
-import { LocalVersion, RemoteVersion } from './types'
+import { LocalVersion, LocalValue, RemoteVersion, RemoteValue } from './types'
 
 export const newAgentName = (): string => (
   crypto.randomBytes(6).toString('base64') // Might need to be longer later.
@@ -28,6 +28,11 @@ export const getAgentId = (db: Database, hash: string): number | undefined => (
 export const localToRemoteVersion = (db: Database, v: LocalVersion): RemoteVersion => ({
   agentHash: getAgentHash(db, v.agent),
   seq: v.seq
+})
+
+export const localToRemoteValue = (db: Database, val: LocalValue): RemoteValue => ({
+  value: val.value,
+  version: localToRemoteVersion(db, val.version)
 })
 
 export const getOrCreateAgentId = (db: Database, hash: string): number => (

@@ -1,12 +1,15 @@
 import polka from 'polka'
 import {open} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
-import { getAgentHash, getOrCreateAgentId, localToRemoteVersion, newAgentName } from './agent'
-import {SchemaInfo, RawValue, LocalVersion, NULL_VALUE, RemoteVersion} from './types'
+import { getAgentHash, getOrCreateAgentId, localToRemoteValue, localToRemoteVersion, newAgentName } from './agent'
+import {SchemaInfo, LocalValue, LocalVersion, NULL_VALUE, RemoteVersion} from './types'
 import bodyParser from 'body-parser'
-import { ServerResponse } from 'http'
+import { IncomingMessage, ServerResponse } from 'http'
 import {keyInc, getLastKey} from './util'
 import fresh from 'fresh'
+import asyncstream, { Stream } from 'ministreamiterator'
+import compress from 'compression'
+import sirv from 'sirv'
 
 const PORT = process.env.PORT || 4040
 
@@ -70,7 +73,7 @@ const urlToParts = (urlpath: string): string[] => {
   return parts
 }
 
-const getDb = (parts: string[]): RawValue | null => {
+const getDb = (parts: string[]): LocalValue | null => {
   if (parts.length !== 2) return null // always /collection/key
 
   const [collectionName, key] = parts
@@ -81,7 +84,7 @@ const getDb = (parts: string[]): RawValue | null => {
   // point but its dang convenient.
 
   // Also at some point use the fdb subspace code to compact subspace prefixes
-  return db.get(docKey(collectionName, key)) as RawValue ?? NULL_VALUE
+  return db.get(docKey(collectionName, key)) as LocalValue ?? NULL_VALUE
 }
 
 const getLastVersion = (id: number): number => {
@@ -90,7 +93,24 @@ const getLastVersion = (id: number): number => {
   return lastKey == null ? -1 : lastKey[lastKey.length - 1] as number
 }
 
+interface StreamingClient {
+  stream: Stream<any>
+}
+const streamsForDocs = new Map<string, Set<StreamingClient>>()
+
+const getStreamsForDoc = (parts: string[]): Set<StreamingClient> => {
+  const k = parts.join('/')
+  let set = streamsForDocs.get(k)
+  if (set == null) {
+    set = new Set()
+    streamsForDocs.set(k, set)
+  }
+  return set
+}
+
 const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => {
+  // TODO: Handle multiple objects being set at once
+  // TODO: Handle conflicts
   if (parts.length !== 2) return null
   const [collectionName, key] = parts
   const schema = collections.get(collectionName)
@@ -102,7 +122,7 @@ const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => 
       agent: localAgent,
       seq: newSeq
     }
-    const value: RawValue = {
+    const value: LocalValue = {
       value: docValue,
       version
     }
@@ -122,11 +142,16 @@ const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => 
       // Do we need anything else here? Probably...
     ])
 
+    // Notify listeners
+    for (const c of getStreamsForDoc(parts)) {
+      c.stream.append(JSON.stringify(localToRemoteValue(db, value)))
+    }
+
     return version
   })
 }
 
-const getInternal = (parts: string[]): RawValue | null => {
+const getInternal = (parts: string[]): LocalValue | null => {
   // console.log('internal', parts)
   switch (parts[0]) {
     case '_status': return { version: transient_version, value: 'ok' }
@@ -139,7 +164,82 @@ const notFound = (res: ServerResponse) => {
   res.end('Not found')
 }
 
+const tryFlush = (res: ServerResponse) => {
+  ;(res as any).flush && (res as any).flush()
+}
+
+const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: string[], data: LocalValue) => {
+  console.log('get sse')
+  // There's 3 cases here:
+  // - The client did not request a version. Send the document then stream updates.
+  // - The client requested an old version.
+  //   - Send all updates since that version if we can
+  //   - Or just send a snapshot
+  // - The client requested the current version. Tell them they're up to date and stream.
+
+  res.writeHead(200, 'OK', {
+    'Cache-Control': 'no-cache',
+    'Content-Type': 'text/event-stream',
+    'Connection': 'keep-alive'
+  })
+
+  // Tell the client to retry every second if connectivity is lost
+  res.write('retry: 3000\n\n');
+
+  let connected = true
+  // const r = get_room(room)
+  const stream = asyncstream()
+  const client = {
+    stream,
+  }
+  const docStreams = getStreamsForDoc(parts)
+  docStreams.add(client)
+
+  // For now we'll just start with a snapshot.
+  stream.append(JSON.stringify(localToRemoteValue(db, data)))
+
+  res.once('close', () => {
+    console.log('Closed connection to client for doc', parts)
+    connected = false
+    stream.end()
+    docStreams.delete(client)
+  })
+
+  ;(async () => {
+    // 30 second heartbeats to avoid timeouts
+    while (true) {
+      await new Promise(res => setTimeout(res, 30*1000))
+
+      if (!connected) break
+      
+      // res.write(`event: heartbeat\ndata: \n\n`);
+      res.write(`data: {}\n\n`)
+      tryFlush(res)
+    }
+  })()
+
+  while (connected) {
+    // await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // console.log('Emit', ++count);
+    // Emit an SSE that contains the current 'count' as a string
+    // res.write(`event: message\r\ndata: ${count}\r\n\r\n`);
+    // res.write(`data: ${count}\nid: ${count}\n\n`);
+    for await (const val of stream.iter) {
+      // console.log('sending val', val)
+      res.write(`data: ${val}\n\n`)
+      tryFlush(res)
+    }
+  }
+}
+
 const app = polka()
+
+app.use(compress(), sirv(__dirname + '/../public', {
+  // maxAge: 31536000, // 1Y
+  // immutable: true
+  dev: process.env.NODE_ENV !== 'production'
+}))
 
 app.use('/raw', (req, res, next) => {
   // const path = req.path.slice(1) // Slice off the 
@@ -156,11 +256,13 @@ const encodeVersion = (version: RemoteVersion): string => (
 
 app.get('/raw/*', (req, res) => {
   const parts = (req as any).parts
-  console.log('get parts', parts)
+  // console.log('get parts', parts)
   const data = parts[0][0] === '_' ? getInternal(parts) : getDb(parts)
-  console.log('data', data)
-  if (data == null) return notFound(res)
 
+  if (req.headers['accept'] === 'text/event-stream') return getSSE(req, res, parts, data ?? NULL_VALUE)
+  // console.log('data', data)
+  if (data == null) return notFound(res)
+  
   const remoteVersion = localToRemoteVersion(db, data.version)
   const resHeaders = {
     'content-type': 'application/json',
@@ -193,12 +295,15 @@ app.put('/raw/*', bodyParser.json(), async (req, res) => {
   const remoteVersion = localToRemoteVersion(db, localVersion)
   res.setHeader('x-version', encodeVersion(remoteVersion))
   
-  // TEMPORARY.
+  // TEMPORARY. I'm not actually sure what data to return in the body here.
+  // Maybe the version is as good as any.
   res.setHeader('content-type', 'application/json')
   res.write(JSON.stringify(remoteVersion))
   
   res.end()
 })
+
+
 
 app.listen(PORT, (err?: Error) => {
   if (err) throw err
