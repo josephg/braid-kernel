@@ -1,8 +1,8 @@
-# SEPH Stack
+# Braid kernel prototype
 
-This is a simple prototype / experiment in database design. Currently entirely nonfunctional.
+This is a simple prototype / experiment in database design.
 
-The goal is to have a database with the following properties:
+The goal is to have a small, simple database with the following properties:
 
 - Simple key/value pairs for records
 - With types defined at the 'directory' level - eg `{"users/*": [User]}`
@@ -22,4 +22,7 @@ The goal is to have a database with the following properties:
 - Good looking dev tools
 - Capability based security model
 
+In its current form it will not:
+
+- Work with anything other than a local lmdb, in a single process
 
