@@ -303,6 +303,11 @@ fill-range@^7.0.1:
   dependencies:
     to-regex-range "^5.0.1"
 
+fresh@^0.5.2:
+  version "0.5.2"
+  resolved "https://registry.yarnpkg.com/fresh/-/fresh-0.5.2.tgz#3d8cadd90d976569fa835ab1f8e4b23a105605a7"
+  integrity sha1-PYyt2Q2XZWn6g1qx+OSyOhBWBac=
+
 fs-extra@^9.0.1:
   version "9.0.1"
   resolved "https://registry.yarnpkg.com/fs-extra/-/fs-extra-9.0.1.tgz#910da0062437ba4c39fedd863f1675ccfefcb9fc"
@@ -450,10 +455,10 @@ jsonfile@^6.0.1:
   optionalDependencies:
     graceful-fs "^4.1.6"
 
-lmdb-store-0.9@0.7.1:
-  version "0.7.1"
-  resolved "https://registry.yarnpkg.com/lmdb-store-0.9/-/lmdb-store-0.9-0.7.1.tgz#904fe5f61e97b6a82eff0cf5b4ce7a697425870e"
-  integrity sha512-1oKz63PsvO1MM581tJZpNs/jEIRWkQsvJyRCewxB8yKxlt3PS+d2x5glsQXKHOzZMqG6wNN83//74InK67Scqg==
+lmdb-store-0.9@0.7.2:
+  version "0.7.2"
+  resolved "https://registry.yarnpkg.com/lmdb-store-0.9/-/lmdb-store-0.9-0.7.2.tgz#45b907a46d0a676fee955629bd2f70f06efb26bb"
+  integrity sha512-/MO8G6p4l7ku1ltCCdE/2ZOtSQBSM0B02vIemMHjoKgjE/fooanJYXIFwtZYM5r/hBDxmO+L3q5ASAXbfHQ6pQ==
   dependencies:
     fs-extra "^9.0.1"
     msgpackr "^0.5.3"
@@ -462,16 +467,16 @@ lmdb-store-0.9@0.7.1:
     weak-lru-cache "^0.2.0"
 
 lmdb-store@^0.8.2:
-  version "0.8.2"
-  resolved "https://registry.yarnpkg.com/lmdb-store/-/lmdb-store-0.8.2.tgz#3d1746e9f197d388aa152c99b7cd20981031e6d6"
-  integrity sha512-8EAP4iDsN0+nVmAcQZ0AWhpDNbflCn5LPvsdOq0F55kPNRSMVIwhKXHx4yJ+bLJEXjxKhxLqQm77U4yuwU6xPw==
+  version "0.8.8"
+  resolved "https://registry.yarnpkg.com/lmdb-store/-/lmdb-store-0.8.8.tgz#7286a1b34387d228d1f7105dea5632dfd347e582"
+  integrity sha512-iteQvo16yc4+xFjVkkOdZymvA1goF76xd2al+N5TqRl0HQWeAqTC1FqRFgTQnZ8ZC6gcLW/XBglT/hiHmjQ3kw==
   dependencies:
     fs-extra "^9.0.1"
-    lmdb-store-0.9 "0.7.1"
+    lmdb-store-0.9 "0.7.2"
     msgpackr "^0.5.3"
     nan "^2.14.1"
     node-gyp-build "^4.2.3"
-    weak-lru-cache "^0.3.0"
+    weak-lru-cache "^0.3.6"
 
 lodash@^4.17.11:
   version "4.17.20"
@@ -790,10 +795,10 @@ weak-lru-cache@^0.2.0:
   resolved "https://registry.yarnpkg.com/weak-lru-cache/-/weak-lru-cache-0.2.2.tgz#f57ee3a9c20bb4e5c507e49db24e7f98f7929d2a"
   integrity sha512-kgCgn7cO+jupnyHNgllhnDuVCAoqFJocGc8GMUWbypJ070rBQEJPZPTCD3LUMJqm1icDIWLb01yaID/7jzajog==
 
-weak-lru-cache@^0.3.0:
-  version "0.3.0"
-  resolved "https://registry.yarnpkg.com/weak-lru-cache/-/weak-lru-cache-0.3.0.tgz#72af521dd22fa0ec0ef3225095c3782ff7cd7783"
-  integrity sha512-ASRnxXq1Sa+sP84XeqkCG7RX633Rl8dIOVmANzFf2IKPpPp7Xky2Z9dOl3VrKc5AYSt0Pa0bOjo6jsc5xoc49g==
+weak-lru-cache@^0.3.6:
+  version "0.3.6"
+  resolved "https://registry.yarnpkg.com/weak-lru-cache/-/weak-lru-cache-0.3.6.tgz#a0f9b429100c476179bfb55d06be3a2d6ab94283"
+  integrity sha512-hI0GVBNRec7xOjkahNbMSOWXNMvKX3UDCnAfL8aBBkVIRW8U2kUAvPUIJXhpd+CI0bSVDByis48iKSuZvmrd/g==
 
 wrappy@1:
   version "1.0.2"
