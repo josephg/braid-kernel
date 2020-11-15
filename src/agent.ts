@@ -16,6 +16,8 @@ const hashforIdKey = (id: number) => pack(['_agent', 'hashof', id])
 const idForHashKey = (hash: string) => pack(['_agent', 'idof', hash])
 
 export const getAgentHash = (db: Database, id: number) => {
+  if (id === -1) return 'LOCAL'
+
   const hash = db.get(hashforIdKey(id))
   if (hash == null) throw Error('Could not find agent hash for id ' + id)
   return hash as string

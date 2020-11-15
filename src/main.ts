@@ -4,12 +4,12 @@ import {pack, unpack} from 'fdb-tuple'
 import { getAgentHash, getOrCreateAgentId, localToRemoteValue, localToRemoteVersion, newAgentName } from './agent'
 import {SchemaInfo, LocalValue, LocalVersion, NULL_VALUE, RemoteVersion} from './types'
 import bodyParser from 'body-parser'
-import { IncomingMessage, ServerResponse } from 'http'
 import {keyInc, getLastKey} from './util'
 import fresh from 'fresh'
-import asyncstream, { Stream } from 'ministreamiterator'
 import compress from 'compression'
 import sirv from 'sirv'
+import { IncomingMessage, ServerResponse } from 'http'
+import { getSSE, notifySubscriptions } from './subscriptions'
 
 const PORT = process.env.PORT || 4040
 
@@ -22,21 +22,13 @@ const db = open({
 // - Set of schemas
 // - Agent info - hash <-> number mapping set and last seen versions
 
-// interface Operation {
-//   new_value: any,
-// }
-
-// interface WriteTransaction {
-
-// }
-
-
-// const applyTxn = async (txn: WriteTransaction) => {
-
-// }
 
 const collections = new Map<string, SchemaInfo>([
-  ['authors', {}],
+  ['authors', {
+    // types
+    // configuration for change tracking
+    // conflict resolution
+  }],
   ['posts', {}],
   ['slugs', {}],
 ])
@@ -93,24 +85,18 @@ const getLastVersion = (id: number): number => {
   return lastKey == null ? -1 : lastKey[lastKey.length - 1] as number
 }
 
-interface StreamingClient {
-  stream: Stream<any>
-}
-const streamsForDocs = new Map<string, Set<StreamingClient>>()
 
-const getStreamsForDoc = (parts: string[]): Set<StreamingClient> => {
-  const k = parts.join('/')
-  let set = streamsForDocs.get(k)
-  if (set == null) {
-    set = new Set()
-    streamsForDocs.set(k, set)
-  }
-  return set
+interface DbTransactionEntry {
+  collection: string,
+  key: string,
+  replaces: LocalVersion,
+  value: any // soon: a reversible operation.
 }
 
 const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => {
   // TODO: Handle multiple objects being set at once
   // TODO: Handle conflicts
+  // TODO: Handle differential updates
   if (parts.length !== 2) return null
   const [collectionName, key] = parts
   const schema = collections.get(collectionName)
@@ -143,9 +129,7 @@ const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => 
     ])
 
     // Notify listeners
-    for (const c of getStreamsForDoc(parts)) {
-      c.stream.append(JSON.stringify(localToRemoteValue(db, value)))
-    }
+    notifySubscriptions(parts, localToRemoteValue(db, value))
 
     return version
   })
@@ -164,74 +148,6 @@ const notFound = (res: ServerResponse) => {
   res.end('Not found')
 }
 
-const tryFlush = (res: ServerResponse) => {
-  ;(res as any).flush && (res as any).flush()
-}
-
-const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: string[], data: LocalValue) => {
-  console.log('get sse')
-  // There's 3 cases here:
-  // - The client did not request a version. Send the document then stream updates.
-  // - The client requested an old version.
-  //   - Send all updates since that version if we can
-  //   - Or just send a snapshot
-  // - The client requested the current version. Tell them they're up to date and stream.
-
-  res.writeHead(200, 'OK', {
-    'Cache-Control': 'no-cache',
-    'Content-Type': 'text/event-stream',
-    'Connection': 'keep-alive'
-  })
-
-  // Tell the client to retry every second if connectivity is lost
-  res.write('retry: 3000\n\n');
-
-  let connected = true
-  // const r = get_room(room)
-  const stream = asyncstream()
-  const client = {
-    stream,
-  }
-  const docStreams = getStreamsForDoc(parts)
-  docStreams.add(client)
-
-  // For now we'll just start with a snapshot.
-  stream.append(JSON.stringify(localToRemoteValue(db, data)))
-
-  res.once('close', () => {
-    console.log('Closed connection to client for doc', parts)
-    connected = false
-    stream.end()
-    docStreams.delete(client)
-  })
-
-  ;(async () => {
-    // 30 second heartbeats to avoid timeouts
-    while (true) {
-      await new Promise(res => setTimeout(res, 30*1000))
-
-      if (!connected) break
-      
-      // res.write(`event: heartbeat\ndata: \n\n`);
-      res.write(`data: {}\n\n`)
-      tryFlush(res)
-    }
-  })()
-
-  while (connected) {
-    // await new Promise(resolve => setTimeout(resolve, 1000));
-
-    // console.log('Emit', ++count);
-    // Emit an SSE that contains the current 'count' as a string
-    // res.write(`event: message\r\ndata: ${count}\r\n\r\n`);
-    // res.write(`data: ${count}\nid: ${count}\n\n`);
-    for await (const val of stream.iter) {
-      // console.log('sending val', val)
-      res.write(`data: ${val}\n\n`)
-      tryFlush(res)
-    }
-  }
-}
 
 const app = polka()
 
@@ -259,15 +175,17 @@ app.get('/raw/*', (req, res) => {
   // console.log('get parts', parts)
   const data = parts[0][0] === '_' ? getInternal(parts) : getDb(parts)
 
-  if (req.headers['accept'] === 'text/event-stream') return getSSE(req, res, parts, data ?? NULL_VALUE)
+  const remoteValue = localToRemoteValue(db, data ?? NULL_VALUE)
+
+  if (req.headers['accept'] === 'text/event-stream') return getSSE(req, res, parts, remoteValue)
   // console.log('data', data)
   if (data == null) return notFound(res)
   
-  const remoteVersion = localToRemoteVersion(db, data.version)
+  // const remoteVersion = localToRemoteVersion(db, data.version)
   const resHeaders = {
     'content-type': 'application/json',
-    etag: encodeVersion(remoteVersion),
-    'x-version': encodeVersion(remoteVersion),
+    etag: encodeVersion(remoteValue.version),
+    'x-version': encodeVersion(remoteValue.version),
   }
   if (fresh(req.headers, resHeaders)) {
     res.writeHead(304, resHeaders)
@@ -275,7 +193,7 @@ app.get('/raw/*', (req, res) => {
   } else {
     res.writeHead(200, resHeaders)
     // res.write(JSON.stringify(data.value))
-    res.end(JSON.stringify(data))
+    res.end(JSON.stringify(remoteValue))
   }
 })
 
