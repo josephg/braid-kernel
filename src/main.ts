@@ -4,7 +4,7 @@ import {pack, unpack} from 'fdb-tuple'
 import { getAgentHash, getOrCreateAgentId, localToRemoteValue, localToRemoteVersion, newAgentName } from './agent'
 import {SchemaInfo, LocalValue, LocalVersion, NULL_VALUE, RemoteVersion} from './types'
 import bodyParser from 'body-parser'
-import {keyInc, getLastKey} from './util'
+import {keyInc, getLastKey, encodeVersion} from './util'
 import fresh from 'fresh'
 import compress from 'compression'
 import sirv from 'sirv'
@@ -165,10 +165,6 @@ app.use('/raw', (req, res, next) => {
   ;(req as any).parts = parts
   next()
 })
-
-const encodeVersion = (version: RemoteVersion): string => (
-  pack([version.agentHash, version.seq]).toString('base64')
-)
 
 app.get('/raw/*', (req, res) => {
   const parts = (req as any).parts

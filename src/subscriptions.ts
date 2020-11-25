@@ -2,6 +2,7 @@ import asyncstream, { Stream } from 'ministreamiterator'
 import { getAgentHash, getOrCreateAgentId, localToRemoteValue, localToRemoteVersion, newAgentName } from './agent'
 import {SchemaInfo, LocalValue, LocalVersion, NULL_VALUE, RemoteVersion, RemoteValue} from './types'
 import { IncomingMessage, ServerResponse } from 'http'
+import { encodeVersion } from './util'
 
 interface StreamingClient {
   stream: Stream<any>
@@ -19,8 +20,13 @@ const getStreamsForDoc = (parts: string[]): Set<StreamingClient> => {
 }
 
 export const notifySubscriptions = (parts: string[], value: RemoteValue) => {
+  const jsonData = JSON.stringify({
+    version: encodeVersion(value.version),
+    data: value.value // For now all updates are snapshot updates.
+  })
+
   for (const c of getStreamsForDoc(parts)) {
-    c.stream.append(JSON.stringify(value))
+    c.stream.append(jsonData)
   }
 }
 
@@ -55,8 +61,16 @@ export const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: s
   const docStreams = getStreamsForDoc(parts)
   docStreams.add(client)
 
-  // For now we'll just start with a snapshot.
-  stream.append(JSON.stringify(initialData))
+  // The initial message says some things about the data
+  stream.append(JSON.stringify({
+    headers: {
+      'x-braid-version': '0.1',
+      'content-type': 'application/json',
+      'x-patch-type': 'full-snapshot'
+    },
+    version: encodeVersion(initialData.version),
+    data: initialData.value
+  }))
 
   res.once('close', () => {
     console.log('Closed connection to client for doc', parts)
@@ -72,8 +86,8 @@ export const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: s
 
       if (!connected) break
       
-      // res.write(`event: heartbeat\ndata: \n\n`);
-      res.write(`data: {}\n\n`)
+      res.write(`event: heartbeat\ndata: \n\n`);
+      // res.write(`data: {}\n\n`)
       tryFlush(res)
     }
   })()

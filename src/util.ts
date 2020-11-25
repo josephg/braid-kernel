@@ -1,8 +1,8 @@
 // Key increment. Find the next string (well, buffer) after this buffer.
 
-import { TupleItem, unpack } from "fdb-tuple";
+import { TupleItem, pack, unpack } from "fdb-tuple";
 import { Database } from "lmdb-store";
-import { LocalVersion, ROOT_VERSION } from "./types";
+import { LocalVersion, RemoteVersion, ROOT_VERSION } from "./types"
 
 // Stolen from node-foundationdb.
 export const keyInc = (val: string | Buffer): Buffer => {
@@ -49,3 +49,7 @@ export const cmpVersions = (_db: Database, a: LocalVersion, b: LocalVersion): nu
     : b.agent === ROOT_AGENT ? 1
     : 0 // Unreachable.
 }
+
+export const encodeVersion = (version: RemoteVersion): string => (
+  pack([version.agentHash, version.seq]).toString('base64')
+)

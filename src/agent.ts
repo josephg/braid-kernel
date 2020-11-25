@@ -2,7 +2,7 @@ import crypto from 'crypto'
 import {getLastKey} from './util'
 import {Database} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
-import { LocalVersion, LocalValue, RemoteVersion, RemoteValue } from './types'
+import { LocalVersion, LocalValue, RemoteVersion, RemoteValue, ROOT_VERSION } from './types'
 
 export const newAgentName = (): string => (
   crypto.randomBytes(6).toString('base64') // Might need to be longer later.
@@ -17,6 +17,7 @@ const idForHashKey = (hash: string) => pack(['_agent', 'idof', hash])
 
 export const getAgentHash = (db: Database, id: number) => {
   if (id === -1) return 'LOCAL'
+  else if (id === ROOT_VERSION.agent) return 'ROOT'
 
   const hash = db.get(hashforIdKey(id))
   if (hash == null) throw Error('Could not find agent hash for id ' + id)
