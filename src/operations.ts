@@ -3,6 +3,15 @@ import assert from 'assert'
 import { versions } from "process"
 import seedrandom from 'seedrandom'
 import Map2 from 'map2'
+import { Console } from "console"
+
+const console = new Console({
+  stdout: process.stdout,
+  stderr: process.stderr,
+  inspectOptions: {
+    depth: null
+  }
+})
 
 // An operation affects multiple documents 
 export interface Operation {
@@ -15,19 +24,17 @@ export interface Operation {
 
 export interface DocOperation {
   key: string,
-  collection: string,
-  prevVersions: LocalVersion[], // Usually one item. Multiple if this is a merge operation.
+  // collection: string,
+  parents: LocalVersion[], // Specific to the document. The named operations edit this doc.
   newValue: any,
 }
 
-export type DocValue = {
-  version: LocalVersion
-  value: any,
-} | { // Version in conflict
+export type DocValue = { // Has multiple entries iff version in conflict.
   version: LocalVersion,
   value: any
 }[]
 
+type OperationSet = Map2<number, number, Operation>
 
 interface DBState {
   data: Map<string, DocValue>
@@ -37,28 +44,92 @@ interface DBState {
   foreignRefs: Map2<number, number, number>
   // This contains every entry in version where foreignRefs is 0 (or equivalently undefined).
   versionFrontier: Set<number> // set of agent ids.
+
+  knownOperations: OperationSet // History of all seen operations
 }
 
 const cloneDb = (db: DBState): DBState => ({
+  // Could also just use new[k] = new old[k].constructor(old[k]).
   data: new Map(db.data),
   version: new Map(db.version),
 
   foreignRefs: new Map2(db.foreignRefs),
   
   versionFrontier: new Set(db.versionFrontier),
+
+  knownOperations: new Map2(db.knownOperations),
 })
 
+// There are 4 cases:
+// - A dominates B (return +ive)
+// - B dominates A (return -ive)
+// - A and B are equal (not checked here)
+// - A and B are concurrent (return 0)
+const compareVersions = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
+  // So there's absolutely ways to optimize this using fancy skip list nonsense
+  // and whatnot, but for now I'm just going to use a pretty standard BFS.
+  if (a.agent === b.agent) return a.seq - b.seq
+
+  const dominates = (a: LocalVersion, bagent: number, bmaxseq: number): boolean => {
+    // We'll expand `a` out into a full version map.
+    const frontier: number[] = [] // Pairs of agent, old max seq
+    const maxVersion = new Map<number, number>() // max version seen for each agent, including in frontier.
+
+    const add = ({agent, seq}: LocalVersion) => {
+      const curMax = maxVersion.get(agent) ?? 0
+      if (curMax == null || seq > curMax) {
+        frontier.push(agent, curMax)
+        maxVersion.set(agent, seq)
+      } // Otherwise ignore it.
+    }
+    add(a)
+    
+    while (frontier.length > 0) {
+      let oldMax = frontier.pop()!
+      let agent = frontier.pop()!
+      let seq = maxVersion.get(agent)!
+
+      // Iterate through all operations from seq back to oldMax
+      while (seq >= oldMax) {
+        const op = allOps.get(agent, seq)
+        if (!op) throw Error(`missing operation: ${agent} ${seq}`)
+        for (const v of op.parents) add(v)
+        if (op.succeeds == null) break
+        seq = op.succeeds
+      }
+
+      // Early return if we've seen it already.
+      if ((maxVersion.get(bagent) ?? 0) >= bmaxseq) break
+    }
+
+    return (maxVersion.get(bagent) ?? 0) >= bmaxseq
+  }
+
+  const adomb = dominates(a, b.agent, b.seq)
+  const bdoma = dominates(b, a.agent, a.seq)
+  if (adomb && bdoma) throw Error('Invalid state - operations do not dominate each other')
+  else return (adomb && !bdoma) ? 1
+    : (!adomb && bdoma) ? -1
+    : 0 // Neither operation dominates the other.
+}
 
 // const localVersionCmp = (a: LocalVersion, b: LocalVersion) => (
 //   a.agent === b.agent ? a.seq - b.seq : a.agent - b.agent
 // )
 
-const applyForwards = (db: DBState, op: Operation) => {
-  // assert(op.parents.find(p => p.agent === op.version.agent) != null, "Operations must succeed own parent")
+const vEq = (a: LocalVersion, b: LocalVersion) => a.agent === b.agent && a.seq === b.seq
 
+const getVal = (db: DBState, key: string): DocValue => (
+  db.data.get(key) ?? [{
+    version: ROOT_VERSION,
+    value: null
+  }]
+)
+
+const applyForwards = (db: DBState, op: Operation) => {
   // The operation supercedes all the versions named in parents with version.
   let oldV = db.version.get(op.version.agent)
-  assert(oldV == null || oldV < op.version.seq)
+  assert(oldV == null || op.version.seq > oldV, "db already contains inserted operation")
 
   for (const {agent, seq} of op.parents) {
     const dbSeq = db.version.get(agent)
@@ -69,26 +140,53 @@ const applyForwards = (db: DBState, op: Operation) => {
     db.foreignRefs.set(agent, seq, oldRefs + 1)
 
     if (dbSeq === seq && oldRefs === 0) db.versionFrontier.delete(agent)
-
-    // if (db.versionFrontier.has(agent)) {
-    //   if (dbSeq === seq) db.versionFrontier.delete(agent)
-    //   // else if dbSeq < seq we're forking. Keep the current frontier and add to it.
-    // }
   }
   db.version.set(op.version.agent, op.version.seq)
   db.versionFrontier.add(op.version.agent)
-  // db.foreignRefs.set(op.version.agent, op.version.seq, 0)
+  db.knownOperations.set(op.version.agent, op.version.seq, op)
 
   // Then apply document changes
+  for (const {key, parents, newValue} of op.docOps) {
+    const prevVals = getVal(db, key)
+
+    // The doc op's parents field contains a subset of the versions present in
+    // oldVal.
+    // - Any entries in prevVals that aren't named in the new operation are kept
+    // - And any entries in parents that aren't directly named in prevVals must
+    //   be ancestors of the current document value. This indicates a conflict,
+    //   and we'll keep everything.
+
+    // We'll check ancestry. Every parent of this operation (parents) must
+    // either be represented directly in prevVals or be dominated of one of
+    // them.
+    for (const v of parents) {
+      const exists = !!prevVals.find(({version: v2}) => vEq(v, v2))
+      if (!exists) {
+        // console.log('Checking ancestry')
+        // We expect one of v2 to dominate v.
+        const ancestry = prevVals.map(({version: v2}) => compareVersions(db.knownOperations, v2, v))
+        assert(ancestry.findIndex(a => a > 0) >= 0)
+      }
+    }
+
+    const newVal = [{version: op.version, value: newValue}]
+    for (const oldEntry of prevVals) {
+      if (parents.find(v => vEq(v, oldEntry.version)) == null) {
+        // Keep this.
+        newVal.push(oldEntry)
+      }
+    }
+
+    db.data.set(key, newVal)
+  }
+
   checkDb(db)
 }
 
 const applyBackwards = (db: DBState, op: Operation) => {
+  // Version stuff
   assert(db.version.get(op.version.agent) === op.version.seq)
-
   assert(db.versionFrontier.has(op.version.agent), "Cannot unapply operations in violation of partial order")
-  assert(db.version.get(op.version.agent) === op.version.seq)
-  // db.versionFrontier.delete(op.version.agent)
 
   if (op.succeeds != null) {
     db.version.set(op.version.agent, op.succeeds)
@@ -113,14 +211,46 @@ const applyBackwards = (db: DBState, op: Operation) => {
     else db.foreignRefs.set(agent, seq, newRefs)
 
     if (newRefs === 0 && dbSeq === seq) db.versionFrontier.add(agent)
-
-    // if (agent === op.version.agent) {
-    //   db.version.set(agent, seq) // Replace the parent in version.
-    // }
-
-    // if (versionFrontier.get(agent) === seq)
-    // if (dbSeq == null) db.versionFrontier.add(agent)
   }
+
+  // Ok now update the data.
+  for (const {key, parents} of op.docOps) {
+    const prevVals = db.data.get(key)!
+
+    // The values should instead contain:
+    // - Everything in prevVals not including op.version
+    // - All the objects named in parents that aren't superceded by another
+    //   document version
+    const newVals = prevVals.filter(({version}) => !vEq(version, op.version))
+    // console.log('prevVals', prevVals)
+    // And append all the parents that aren't dominated by another value.
+    for (const p of parents) {
+      // TODO: Assert p not already represented in prevVals, which would be invalid.
+
+      // If p is dominated by a value in prevVals, skip.
+      const dominated = newVals.map(({version}) => compareVersions(db.knownOperations, p, version))
+      if (dominated.findIndex(x => x < 0) >= 0) continue
+
+      if (vEq(p, ROOT_VERSION)) {
+        assert(newVals.length === 0)
+      } else {
+        const parentOp = db.knownOperations.get(p.agent, p.seq)!
+        assert(parentOp)
+        const parentDocOp = parentOp.docOps.find(({key: key2}) => key === key2)!
+        assert(parentDocOp)
+        newVals.push({version: p, value: parentDocOp.newValue})
+      }
+    }
+
+    // console.log('newVals', newVals)
+    // This is a bit dirty, to handle the root.
+    if (newVals.length === 0) db.data.delete(key)
+    else db.data.set(key, newVals)
+  }
+
+  // Not strictly necessary.
+  db.knownOperations.delete(op.version.agent, op.version.seq)
+
   checkDb(db)
 }
 
@@ -140,6 +270,7 @@ const checkDb = (db: DBState) => {
 
 const randomReal = seedrandom("hi")
 const randomInt = (max: number) => (randomReal.int32() + 0xffffffff) % max
+const randItem = <T>(arr: T[]): T => arr[randomInt(arr.length)]
 
 const randomOp = (db: DBState, ownedAgents: number[]): Operation => {
   const agent = ownedAgents[randomInt(ownedAgents.length)]
@@ -152,12 +283,18 @@ const randomOp = (db: DBState, ownedAgents: number[]): Operation => {
   const parents: LocalVersion[] = Array.from(db.versionFrontier)
   .filter(a => a !== agent)
   .map((agent) => ({agent, seq: db.version.get(agent)!}))
-  // if (oldVersion != null) parents.push({agent, seq: oldVersion})
+
+  const key = randItem(['a', 'b', 'c', 'd', 'e', 'f'])
+  const docParents = getVal(db, key).map(({version}) => version)
 
   return {
     version: {agent, seq},
     succeeds: oldVersion || null,
-    docOps: [],
+    docOps: [{
+      key: key,
+      newValue: randomInt(100),
+      parents: docParents
+    }],
     parents
   }
 }
@@ -173,7 +310,8 @@ const test = () => {
     data: new Map<string, DocValue>(),
     version: new Map<number, number>([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
     foreignRefs: new Map2(),
-    versionFrontier: new Set([ROOT_VERSION.agent]) // Kept in sorted order based on comparator.
+    versionFrontier: new Set([ROOT_VERSION.agent]), // Kept in sorted order based on comparator.
+    knownOperations: new Map2(),
   }
   checkDb(db)
 
@@ -185,7 +323,7 @@ const test = () => {
       ops: [] as Operation[]
     }))
 
-    // console.log('db', db)
+    console.log('db', db.data)
     // Generate some random operations for the peers
     for (let i = 0; i < numOpsPerIter; i++) {
       const peerId = randomInt(peerState.length)
@@ -207,14 +345,17 @@ const test = () => {
         const localDb = cloneDb(db)
 
         peer.ops.forEach(op => {
+          // console.log('apply forwards', localDb, op)
           applyForwards(localDb, op)
         })
+        // console.log('->', localDb)
         assert.deepStrictEqual(localDb, peer.db)
         
         peer.ops.slice().reverse().forEach(op => {
           // console.log('apply backwards', localDb, op)
           applyBackwards(localDb, op)
         })
+        // console.log('<-', localDb)
         assert.deepStrictEqual(localDb, db)
       })
     }
