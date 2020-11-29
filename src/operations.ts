@@ -13,6 +13,8 @@ const console = new Console({
   }
 })
 
+const CHECK = process.env['NOCHECK'] ? false : true
+
 // An operation affects multiple documents 
 export interface Operation {
   version: LocalVersion,
@@ -20,6 +22,13 @@ export interface Operation {
   parents: LocalVersion[], // This does not include the direct parent.
 
   docOps: DocOperation[],
+}
+
+type OperationWithOrder = Operation & {
+  // This is filled in when an operation is added to the store. It is a local
+  // order defined such that if a > b, a.localOrder > b.localOrder. If two
+  // operations are concurrent they could end up in any order.
+  localOrder: number,
 }
 
 export interface DocOperation {
@@ -34,7 +43,7 @@ export type DocValue = { // Has multiple entries iff version in conflict.
   value: any
 }[]
 
-type OperationSet = Map2<number, number, Operation>
+type OperationSet = Map2<number, number, OperationWithOrder>
 
 interface DBState {
   data: Map<string, DocValue>
@@ -45,6 +54,8 @@ interface DBState {
   // This contains every entry in version where foreignRefs is 0 (or equivalently undefined).
   versionFrontier: Set<number> // set of agent ids.
 
+  // This stuff is not compared when we compare databases.
+  nextOrder: number,
   knownOperations: OperationSet // History of all seen operations
 }
 
@@ -57,8 +68,19 @@ const cloneDb = (db: DBState): DBState => ({
   
   versionFrontier: new Set(db.versionFrontier),
 
+  nextOrder: db.nextOrder,
   knownOperations: new Map2(db.knownOperations),
 })
+
+const assertDbEq = (a: DBState, b: DBState) => {
+  if (!CHECK) return
+
+  assert.deepStrictEqual(a.data, b.data)
+  assert.deepStrictEqual(a.version, b.version)
+  assert.deepStrictEqual(a.foreignRefs, b.foreignRefs)
+  assert.deepStrictEqual(a.versionFrontier, b.versionFrontier)
+  // assert.deepStrictEqual(a.knownOperations, b.knownOperations)
+}
 
 // There are 4 cases:
 // - A dominates B (return +ive)
@@ -143,7 +165,7 @@ const applyForwards = (db: DBState, op: Operation) => {
   }
   db.version.set(op.version.agent, op.version.seq)
   db.versionFrontier.add(op.version.agent)
-  db.knownOperations.set(op.version.agent, op.version.seq, op)
+  db.knownOperations.set(op.version.agent, op.version.seq, {...op, localOrder: db.nextOrder++})
 
   // Then apply document changes
   for (const {key, parents, newValue} of op.docOps) {
@@ -255,6 +277,8 @@ const applyBackwards = (db: DBState, op: Operation) => {
 }
 
 const checkDb = (db: DBState) => {
+  if (!CHECK) return
+
   // The frontier entries should always be at the current version
   // console.log('checkdb', db)
   for (const [agent, seq] of db.version) {
@@ -264,6 +288,22 @@ const checkDb = (db: DBState) => {
       assert(db.foreignRefs.get(agent, seq) !== 0)
     } else {
       assert.notStrictEqual(db.foreignRefs.get(agent, seq) ?? 0, 0, "missing frontier element: " + agent)
+    }
+  }
+
+  // Scan all the operations. For each operation with parents, those parents
+  // should have a smaller localOrder field.
+  for (const [agent, seq, op] of db.knownOperations) {
+    const thisOrder = op.localOrder
+    // Check the direct parent
+    if (op.succeeds != null) {
+      assert(db.knownOperations.get(agent, op.succeeds)!.localOrder < thisOrder)
+    }
+    
+    for (const {agent, seq} of op.parents) {
+      if (agent !== 0 && seq !== 0) {
+        assert(db.knownOperations.get(agent, seq)!.localOrder < thisOrder)
+      }
     }
   }
 }
@@ -311,6 +351,7 @@ const test = () => {
     version: new Map<number, number>([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
     foreignRefs: new Map2(),
     versionFrontier: new Set([ROOT_VERSION.agent]), // Kept in sorted order based on comparator.
+    nextOrder: 0,
     knownOperations: new Map2(),
   }
   checkDb(db)
@@ -323,7 +364,7 @@ const test = () => {
       ops: [] as Operation[]
     }))
 
-    console.log('db', db.data)
+    // console.log('db', db.data)
     // Generate some random operations for the peers
     for (let i = 0; i < numOpsPerIter; i++) {
       const peerId = randomInt(peerState.length)
@@ -349,14 +390,14 @@ const test = () => {
           applyForwards(localDb, op)
         })
         // console.log('->', localDb)
-        assert.deepStrictEqual(localDb, peer.db)
+        assertDbEq(localDb, peer.db)
         
         peer.ops.slice().reverse().forEach(op => {
           // console.log('apply backwards', localDb, op)
           applyBackwards(localDb, op)
         })
         // console.log('<-', localDb)
-        assert.deepStrictEqual(localDb, db)
+        assertDbEq(localDb, db)
       })
     }
 
@@ -385,7 +426,7 @@ const test = () => {
         })
       })
 
-      assert.deepStrictEqual(localDb, db)
+      assertDbEq(localDb, db)
     }
 
     db = final1
