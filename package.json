@@ -12,6 +12,7 @@
   "dependencies": {
     "@types/compression": "^1.7.0",
     "@types/fresh": "^0.5.0",
+    "@types/priorityqueuejs": "^1.0.1",
     "body-parser": "^1.19.0",
     "compression": "^1.7.4",
     "fdb-tuple": "^1.0.0",
@@ -20,6 +21,7 @@
     "map2": "^1.1.2",
     "ministreamiterator": "^1.0.0",
     "polka": "^0.5.2",
+    "priorityqueuejs": "^2.0.0",
     "sirv": "^1.0.7"
   },
   "devDependencies": {
