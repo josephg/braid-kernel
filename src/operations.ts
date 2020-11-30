@@ -85,68 +85,16 @@ const assertDbEq = (a: DBState, b: DBState) => {
   // assert.deepStrictEqual(a.knownOperations, b.knownOperations)
 }
 
-let iter1 = 0
-let iter2 = 0
-
 // There are 4 cases:
 // - A dominates B (return +ive)
 // - B dominates A (return -ive)
 // - A and B are equal (not checked here)
 // - A and B are concurrent (return 0)
-const compareVersions1 = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
-  // So there's absolutely ways to optimize this using fancy skip list nonsense
-  // and whatnot, but for now I'm just going to use a pretty standard BFS.
-  if (a.agent === b.agent) return a.seq - b.seq
-
-  const dominates = (a: LocalVersion, bagent: number, bmaxseq: number): boolean => {
-    // We'll expand `a` out into a full version map.
-    const frontier: number[] = [] // Pairs of agent, old max seq
-    const maxVersion = new Map<number, number>() // max version seen for each agent, including in frontier.
-
-    const add = ({agent, seq}: LocalVersion) => {
-      const curMax = maxVersion.get(agent) ?? 0
-      if (curMax == null || seq > curMax) {
-        frontier.push(agent, curMax)
-        maxVersion.set(agent, seq)
-      } // Otherwise ignore it.
-    }
-    add(a)
-    
-    while (frontier.length > 0) {
-      iter1++
-      let oldMax = frontier.pop()!
-      let agent = frontier.pop()!
-      let seq = maxVersion.get(agent)!
-
-      // Iterate through all operations from seq back to oldMax
-      while (seq >= oldMax) {
-        const op = allOps.get(agent, seq)
-        if (!op) throw Error(`missing operation: ${agent} ${seq}`)
-        for (const v of op.parents) add(v)
-        if (op.succeeds == null) break
-        seq = op.succeeds
-      }
-
-      // Early return if we've seen it already.
-      if ((maxVersion.get(bagent) ?? 0) >= bmaxseq) break
-    }
-
-    return (maxVersion.get(bagent) ?? 0) >= bmaxseq
-  }
-
-  const adomb = dominates(a, b.agent, b.seq)
-  const bdoma = dominates(b, a.agent, a.seq)
-  if (adomb && bdoma) throw Error('Invalid state - operations do not dominate each other')
-  else return (adomb && !bdoma) ? 1
-    : (!adomb && bdoma) ? -1
-    : 0 // Neither operation dominates the other.
-}
-
 const getLocalOrder = (allOps: OperationSet, agent: number, seq: number): number => (
   agent === 0 && seq === 0 ? -1 : allOps.get(agent, seq)!.localOrder
 )
 
-const compareVersions2 = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
+const compareVersions = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
   if (a.agent === b.agent) return a.seq - b.seq
 
   // This works is via a DFS from the operation with a higher localOrder looking
@@ -164,7 +112,7 @@ const compareVersions2 = (allOps: OperationSet, a: LocalVersion, b: LocalVersion
   let found = false
 
   const visit = (agent: number, seq: number) => {
-    iter2++
+    // iter2++
     // console.log('visiting', agent, seq)
     const op = allOps.get(agent, seq)
     assert(op == null === (agent === 0 && seq === 0))
@@ -196,19 +144,8 @@ const compareVersions2 = (allOps: OperationSet, a: LocalVersion, b: LocalVersion
   else return 0
 }
 
-const compareVersionsCheck = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
-  if (false) {
-    
-    const r1 = compareVersions1(allOps, a, b)
-    const r2 = compareVersions2(allOps, a, b)
-
-    // console.log('r1', r1, 'r2', r2, a, b)
-
-    assert(Math.sign(r1) === Math.sign(r2))
-    return r1
-  } else {
-    return compareVersions2(allOps, a, b)
-  }
+const diff = (allOps: OperationSet, a: LocalVersion[], b: LocalVersion[]) => {
+  // const aOnly = new Set
 }
 
 // const localVersionCmp = (a: LocalVersion, b: LocalVersion) => (
@@ -262,7 +199,7 @@ const applyForwards = (db: DBState, op: Operation) => {
       if (!exists) {
         // console.log('Checking ancestry')
         // We expect one of v2 to dominate v.
-        const ancestry = prevVals.map(({version: v2}) => compareVersionsCheck(db.knownOperations, v2, v))
+        const ancestry = prevVals.map(({version: v2}) => compareVersions(db.knownOperations, v2, v))
         assert(ancestry.findIndex(a => a > 0) >= 0)
       }
     }
@@ -326,7 +263,7 @@ const applyBackwards = (db: DBState, op: Operation) => {
       // TODO: Assert p not already represented in prevVals, which would be invalid.
 
       // If p is dominated by a value in prevVals, skip.
-      const dominated = newVals.map(({version}) => compareVersionsCheck(db.knownOperations, p, version))
+      const dominated = newVals.map(({version}) => compareVersions(db.knownOperations, p, version))
       if (dominated.findIndex(x => x < 0) >= 0) continue
 
       if (vEq(p, ROOT_VERSION)) {
@@ -523,5 +460,3 @@ const test = () => {
 }
 
 test()
-console.log('iter1', iter1)
-console.log('iter2', iter2)
