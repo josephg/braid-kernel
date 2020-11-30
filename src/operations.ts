@@ -4,6 +4,7 @@ import { versions } from "process"
 import seedrandom from 'seedrandom'
 import Map2 from 'map2'
 import { Console } from "console"
+import PriorityQueue from 'priorityqueuejs'
 
 const console = new Console({
   stdout: process.stdout,
@@ -14,6 +15,7 @@ const console = new Console({
 })
 
 const CHECK = process.env['NOCHECK'] ? false : true
+if (CHECK) console.log('running in checked mode')
 
 // An operation affects multiple documents 
 export interface Operation {
@@ -69,6 +71,7 @@ const cloneDb = (db: DBState): DBState => ({
   versionFrontier: new Set(db.versionFrontier),
 
   nextOrder: db.nextOrder,
+  // knownOperations: db.knownOperations,
   knownOperations: new Map2(db.knownOperations),
 })
 
@@ -82,12 +85,15 @@ const assertDbEq = (a: DBState, b: DBState) => {
   // assert.deepStrictEqual(a.knownOperations, b.knownOperations)
 }
 
+let iter1 = 0
+let iter2 = 0
+
 // There are 4 cases:
 // - A dominates B (return +ive)
 // - B dominates A (return -ive)
 // - A and B are equal (not checked here)
 // - A and B are concurrent (return 0)
-const compareVersions = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
+const compareVersions1 = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
   // So there's absolutely ways to optimize this using fancy skip list nonsense
   // and whatnot, but for now I'm just going to use a pretty standard BFS.
   if (a.agent === b.agent) return a.seq - b.seq
@@ -107,6 +113,7 @@ const compareVersions = (allOps: OperationSet, a: LocalVersion, b: LocalVersion)
     add(a)
     
     while (frontier.length > 0) {
+      iter1++
       let oldMax = frontier.pop()!
       let agent = frontier.pop()!
       let seq = maxVersion.get(agent)!
@@ -133,6 +140,75 @@ const compareVersions = (allOps: OperationSet, a: LocalVersion, b: LocalVersion)
   else return (adomb && !bdoma) ? 1
     : (!adomb && bdoma) ? -1
     : 0 // Neither operation dominates the other.
+}
+
+const getLocalOrder = (allOps: OperationSet, agent: number, seq: number): number => (
+  agent === 0 && seq === 0 ? -1 : allOps.get(agent, seq)!.localOrder
+)
+
+const compareVersions2 = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
+  if (a.agent === b.agent) return a.seq - b.seq
+
+  // This works is via a DFS from the operation with a higher localOrder looking
+  // for the localOrder of the smaller operation.
+
+  const aOrder = getLocalOrder(allOps, a.agent, a.seq)
+  // console.log(b.agent, b.seq)
+  const bOrder = getLocalOrder(allOps, b.agent, b.seq)
+  assert(aOrder !== bOrder) // Should have returned above in this case.
+
+  const [start, target] = aOrder > bOrder ? [a, bOrder] : [b, aOrder]
+
+  const visited = new Set<number>() // Set of localOrders.
+
+  let found = false
+
+  const visit = (agent: number, seq: number) => {
+    iter2++
+    // console.log('visiting', agent, seq)
+    const op = allOps.get(agent, seq)
+    assert(op == null === (agent === 0 && seq === 0))
+    const order = op == null ? -1 : op.localOrder
+    
+    if (order === target) {
+      found = true
+      return
+    } else if (order < target) { return }
+
+    if (visited.has(order)) return
+    visited.add(order)
+
+    assert(op) // If we hit the root operation, we should have already returned.
+
+    if (op.succeeds != null) visit(agent, op.succeeds)
+
+    for (const v of op.parents) {
+      if (found) return
+      visit(v.agent, v.seq)
+    }
+  }
+
+  visit(start.agent, start.seq)
+
+  // Note its impossible for the operation with a smaller localOrder to dominate
+  // the op with a larger localOrder.
+  if (found) return aOrder - bOrder
+  else return 0
+}
+
+const compareVersionsCheck = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
+  if (false) {
+    
+    const r1 = compareVersions1(allOps, a, b)
+    const r2 = compareVersions2(allOps, a, b)
+
+    // console.log('r1', r1, 'r2', r2, a, b)
+
+    assert(Math.sign(r1) === Math.sign(r2))
+    return r1
+  } else {
+    return compareVersions2(allOps, a, b)
+  }
 }
 
 // const localVersionCmp = (a: LocalVersion, b: LocalVersion) => (
@@ -186,7 +262,7 @@ const applyForwards = (db: DBState, op: Operation) => {
       if (!exists) {
         // console.log('Checking ancestry')
         // We expect one of v2 to dominate v.
-        const ancestry = prevVals.map(({version: v2}) => compareVersions(db.knownOperations, v2, v))
+        const ancestry = prevVals.map(({version: v2}) => compareVersionsCheck(db.knownOperations, v2, v))
         assert(ancestry.findIndex(a => a > 0) >= 0)
       }
     }
@@ -250,7 +326,7 @@ const applyBackwards = (db: DBState, op: Operation) => {
       // TODO: Assert p not already represented in prevVals, which would be invalid.
 
       // If p is dominated by a value in prevVals, skip.
-      const dominated = newVals.map(({version}) => compareVersions(db.knownOperations, p, version))
+      const dominated = newVals.map(({version}) => compareVersionsCheck(db.knownOperations, p, version))
       if (dominated.findIndex(x => x < 0) >= 0) continue
 
       if (vEq(p, ROOT_VERSION)) {
@@ -344,7 +420,7 @@ const test = () => {
   const numPeers = 3
   const numOpsPerIter = 10
   // const numOpsPerIter = 10
-  const numIterations = 100
+  const numIterations = 1000
 
   let db: DBState = {
     data: new Map<string, DocValue>(),
@@ -447,3 +523,5 @@ const test = () => {
 }
 
 test()
+console.log('iter1', iter1)
+console.log('iter2', iter2)
