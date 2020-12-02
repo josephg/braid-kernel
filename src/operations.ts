@@ -18,24 +18,31 @@ const CHECK = process.env['NOCHECK'] ? false : true
 if (CHECK) console.log('running in checked mode')
 
 // An operation affects multiple documents 
-export interface Operation {
-  version: LocalVersion,
-  succeeds: number | null,
+export interface RawOperation {
+  version: LocalVersion, // These could be RawVersions.
+  succeedsSeq: number | null,
   parents: LocalVersion[], // This does not include the direct parent.
 
   docOps: DocOperation[],
 }
 
-type OperationWithOrder = Operation & {
+interface LocalOperation {
+  version: LocalVersion,
+
   // This is filled in when an operation is added to the store. It is a local
   // order defined such that if a > b, a.localOrder > b.localOrder. If two
   // operations are concurrent they could end up in any order.
-  localOrder: number,
+  order: number,
+  succeedsOrder: number, // Or -1.
+  parents: number[] // localOrder of parents. Does not include direct parent.
+  docOps: DocOperation[],
 }
 
 export interface DocOperation {
   key: string,
   // collection: string,
+
+  // TODO: Change parents to a local order too.
   parents: LocalVersion[], // Specific to the document. The named operations edit this doc.
   newValue: any,
 }
@@ -45,7 +52,7 @@ export type DocValue = { // Has multiple entries iff version in conflict.
   value: any
 }[]
 
-type OperationSet = Map2<number, number, OperationWithOrder>
+type OperationSet = Map2<number, number, number>
 
 interface DBState {
   data: Map<string, DocValue>
@@ -57,8 +64,8 @@ interface DBState {
   versionFrontier: Set<number> // set of agent ids.
 
   // This stuff is not compared when we compare databases.
-  nextOrder: number,
-  knownOperations: OperationSet // History of all seen operations
+  operations: LocalOperation[], // order => operation.
+  versionToOrder: OperationSet, // agent,seq => order.
 }
 
 const cloneDb = (db: DBState): DBState => ({
@@ -70,9 +77,10 @@ const cloneDb = (db: DBState): DBState => ({
   
   versionFrontier: new Set(db.versionFrontier),
 
-  nextOrder: db.nextOrder,
-  // knownOperations: db.knownOperations,
-  knownOperations: new Map2(db.knownOperations),
+  // operations: db.operations,
+  // versionToOrder: db.versionToOrder,
+  operations: db.operations.slice(),
+  versionToOrder: new Map2(db.versionToOrder),
 })
 
 const assertDbEq = (a: DBState, b: DBState) => {
@@ -91,52 +99,52 @@ const assertDbEq = (a: DBState, b: DBState) => {
 // - A and B are equal (not checked here)
 // - A and B are concurrent (return 0)
 const getLocalOrder = (allOps: OperationSet, agent: number, seq: number): number => (
-  agent === 0 && seq === 0 ? -1 : allOps.get(agent, seq)!.localOrder
+  agent === 0 && seq === 0 ? -1 : allOps.get(agent, seq)!
 )
 
-const compareVersions = (allOps: OperationSet, a: LocalVersion, b: LocalVersion): number => {
+const compareVersions = (db: DBState, a: LocalVersion, b: LocalVersion): number => {
   if (a.agent === b.agent) return a.seq - b.seq
 
   // This works is via a DFS from the operation with a higher localOrder looking
   // for the localOrder of the smaller operation.
 
-  const aOrder = getLocalOrder(allOps, a.agent, a.seq)
+  const aOrder = getLocalOrder(db.versionToOrder, a.agent, a.seq)
   // console.log(b.agent, b.seq)
-  const bOrder = getLocalOrder(allOps, b.agent, b.seq)
+  const bOrder = getLocalOrder(db.versionToOrder, b.agent, b.seq)
   assert(aOrder !== bOrder) // Should have returned above in this case.
 
-  const [start, target] = aOrder > bOrder ? [a, bOrder] : [b, aOrder]
+  const [start, target] = aOrder > bOrder ? [aOrder, bOrder] : [bOrder, aOrder]
 
   const visited = new Set<number>() // Set of localOrders.
 
   let found = false
 
-  const visit = (agent: number, seq: number) => {
+  const visit = (order: number) => {
     // iter2++
     // console.log('visiting', agent, seq)
-    const op = allOps.get(agent, seq)
-    assert(op == null === (agent === 0 && seq === 0))
-    const order = op == null ? -1 : op.localOrder
     
     if (order === target) {
       found = true
       return
     } else if (order < target) { return }
+    
+    const op = db.operations[order]
+    assert(op != null)
 
     if (visited.has(order)) return
     visited.add(order)
 
     assert(op) // If we hit the root operation, we should have already returned.
 
-    if (op.succeeds != null) visit(agent, op.succeeds)
+    if (op.succeedsOrder > -1) visit(op.succeedsOrder)
 
-    for (const v of op.parents) {
+    for (const p of op.parents) {
       if (found) return
-      visit(v.agent, v.seq)
+      visit(p)
     }
   }
 
-  visit(start.agent, start.seq)
+  visit(start)
 
   // Note its impossible for the operation with a smaller localOrder to dominate
   // the op with a larger localOrder.
@@ -161,7 +169,7 @@ const getVal = (db: DBState, key: string): DocValue => (
   }]
 )
 
-const applyForwards = (db: DBState, op: Operation) => {
+const applyForwards = (db: DBState, op: RawOperation) => {
   // The operation supercedes all the versions named in parents with version.
   let oldV = db.version.get(op.version.agent)
   assert(oldV == null || op.version.seq > oldV, "db already contains inserted operation")
@@ -178,8 +186,24 @@ const applyForwards = (db: DBState, op: Operation) => {
   }
   db.version.set(op.version.agent, op.version.seq)
   db.versionFrontier.add(op.version.agent)
-  db.knownOperations.set(op.version.agent, op.version.seq, {...op, localOrder: db.nextOrder++})
 
+  // The operation might already be known in the database.
+  let order = db.versionToOrder.get(op.version.agent, op.version.seq)
+  if (order == null) {
+    order = db.operations.length
+    db.versionToOrder.set(op.version.agent, op.version.seq, order)
+  }
+  
+  const localOp: LocalOperation = {
+    version: op.version,
+    order,
+    parents: op.parents.map(v => db.versionToOrder.get(v.agent, v.seq) ?? -1),
+    succeedsOrder: op.succeedsSeq == null ? -1
+      : db.versionToOrder.get(op.version.agent, op.succeedsSeq)!,
+    docOps: op.docOps,
+  }
+  db.operations[order] = localOp // Appends if necessary.
+  
   // Then apply document changes
   for (const {key, parents, newValue} of op.docOps) {
     const prevVals = getVal(db, key)
@@ -199,7 +223,7 @@ const applyForwards = (db: DBState, op: Operation) => {
       if (!exists) {
         // console.log('Checking ancestry')
         // We expect one of v2 to dominate v.
-        const ancestry = prevVals.map(({version: v2}) => compareVersions(db.knownOperations, v2, v))
+        const ancestry = prevVals.map(({version: v2}) => compareVersions(db, v2, v))
         assert(ancestry.findIndex(a => a > 0) >= 0)
       }
     }
@@ -218,14 +242,14 @@ const applyForwards = (db: DBState, op: Operation) => {
   checkDb(db)
 }
 
-const applyBackwards = (db: DBState, op: Operation) => {
+const applyBackwards = (db: DBState, op: RawOperation) => {
   // Version stuff
   assert(db.version.get(op.version.agent) === op.version.seq)
   assert(db.versionFrontier.has(op.version.agent), "Cannot unapply operations in violation of partial order")
 
-  if (op.succeeds != null) {
-    db.version.set(op.version.agent, op.succeeds)
-    if ((db.foreignRefs.get(op.version.agent, op.succeeds) ?? 0) !== 0) {
+  if (op.succeedsSeq != null) {
+    db.version.set(op.version.agent, op.succeedsSeq)
+    if ((db.foreignRefs.get(op.version.agent, op.succeedsSeq) ?? 0) !== 0) {
       db.versionFrontier.delete(op.version.agent)
     }
   } else {
@@ -263,13 +287,13 @@ const applyBackwards = (db: DBState, op: Operation) => {
       // TODO: Assert p not already represented in prevVals, which would be invalid.
 
       // If p is dominated by a value in prevVals, skip.
-      const dominated = newVals.map(({version}) => compareVersions(db.knownOperations, p, version))
+      const dominated = newVals.map(({version}) => compareVersions(db, p, version))
       if (dominated.findIndex(x => x < 0) >= 0) continue
 
       if (vEq(p, ROOT_VERSION)) {
         assert(newVals.length === 0)
       } else {
-        const parentOp = db.knownOperations.get(p.agent, p.seq)!
+        const parentOp = db.operations[db.versionToOrder.get(p.agent, p.seq)!]
         assert(parentOp)
         const parentDocOp = parentOp.docOps.find(({key: key2}) => key === key2)!
         assert(parentDocOp)
@@ -283,8 +307,9 @@ const applyBackwards = (db: DBState, op: Operation) => {
     else db.data.set(key, newVals)
   }
 
-  // Not strictly necessary.
-  db.knownOperations.delete(op.version.agent, op.version.seq)
+  // Not strictly necessary. Actually its tricky - I'd need to delete the
+  // versionToOrder entry and the operation out of the known set.
+  // db.versionToOrder.delete(op.version.agent, op.version.seq)
 
   checkDb(db)
 }
@@ -306,17 +331,21 @@ const checkDb = (db: DBState) => {
 
   // Scan all the operations. For each operation with parents, those parents
   // should have a smaller localOrder field.
-  for (const [agent, seq, op] of db.knownOperations) {
-    const thisOrder = op.localOrder
+  for (const [order, op] of db.operations.entries()) {
+    assert.strictEqual(op.order, order)
+    const {agent, seq} = op.version
+    assert.strictEqual(db.versionToOrder.get(agent, seq), order)
+
     // Check the direct parent
-    if (op.succeeds != null) {
-      assert(db.knownOperations.get(agent, op.succeeds)!.localOrder < thisOrder)
+    if (op.succeedsOrder > -1) {
+      assert(op.succeedsOrder < order)
+      // Direct parent has a matching agent id.
+      assert.strictEqual(db.operations[op.succeedsOrder].version.agent, agent)
     }
     
-    for (const {agent, seq} of op.parents) {
-      if (agent !== 0 && seq !== 0) {
-        assert(db.knownOperations.get(agent, seq)!.localOrder < thisOrder)
-      }
+    for (const o of op.parents) {
+      assert(o < order)
+      if (o > -1) assert.notStrictEqual(db.operations[o].version.agent, agent)
     }
   }
 }
@@ -325,7 +354,7 @@ const randomReal = seedrandom("hi")
 const randomInt = (max: number) => (randomReal.int32() + 0xffffffff) % max
 const randItem = <T>(arr: T[]): T => arr[randomInt(arr.length)]
 
-const randomOp = (db: DBState, ownedAgents: number[]): Operation => {
+const randomOp = (db: DBState, ownedAgents: number[]): RawOperation => {
   const agent = ownedAgents[randomInt(ownedAgents.length)]
   const oldVersion = db.version.get(agent)
   // We'll need to use the next sequence number from the current state
@@ -342,13 +371,13 @@ const randomOp = (db: DBState, ownedAgents: number[]): Operation => {
 
   return {
     version: {agent, seq},
-    succeeds: oldVersion || null,
+    succeedsSeq: oldVersion ?? null,
+    parents,
     docOps: [{
       key: key,
       newValue: randomInt(100),
       parents: docParents
     }],
-    parents
   }
 }
 
@@ -357,15 +386,15 @@ const test = () => {
   const numPeers = 3
   const numOpsPerIter = 10
   // const numOpsPerIter = 10
-  const numIterations = 1000
+  const numIterations = 300
 
   let db: DBState = {
     data: new Map<string, DocValue>(),
     version: new Map<number, number>([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
     foreignRefs: new Map2(),
     versionFrontier: new Set([ROOT_VERSION.agent]), // Kept in sorted order based on comparator.
-    nextOrder: 0,
-    knownOperations: new Map2(),
+    versionToOrder: new Map2(),
+    operations: []
   }
   checkDb(db)
 
@@ -374,7 +403,7 @@ const test = () => {
   for (let iter = 0; iter < numIterations; iter++) {
     let peerState = new Array(numPeers).fill(null).map(() => ({
       db: cloneDb(db),
-      ops: [] as Operation[]
+      ops: [] as RawOperation[]
     }))
 
     // console.log('db', db.data)
