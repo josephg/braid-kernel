@@ -58,8 +58,8 @@ interface DBState {
   data: Map<string, DocValue>
 
   version: Map<number, number> // Expanded for all agents
-  // The number of times each (agent, seq) is referenced by an operation with a different version agent.
-  foreignRefs: Map2<number, number, number>
+  // The number of times each (agent, seq) is referenced by an operations
+  refs: Map2<number, number, number>
   // This contains every entry in version where foreignRefs is 0 (or equivalently undefined).
   versionFrontier: Set<number> // set of agent ids.
 
@@ -73,7 +73,7 @@ const cloneDb = (db: DBState): DBState => ({
   data: new Map(db.data),
   version: new Map(db.version),
 
-  foreignRefs: new Map2(db.foreignRefs),
+  refs: new Map2(db.refs),
   
   versionFrontier: new Set(db.versionFrontier),
 
@@ -88,7 +88,7 @@ const assertDbEq = (a: DBState, b: DBState) => {
 
   assert.deepStrictEqual(a.data, b.data)
   assert.deepStrictEqual(a.version, b.version)
-  assert.deepStrictEqual(a.foreignRefs, b.foreignRefs)
+  assert.deepStrictEqual(a.refs, b.refs)
   assert.deepStrictEqual(a.versionFrontier, b.versionFrontier)
   // assert.deepStrictEqual(a.knownOperations, b.knownOperations)
 }
@@ -216,17 +216,13 @@ const diff = (db: DBState, a: number[], b: number[]) => {
 
     if (order < 0) continue // Bottom out at the root operation.
     const op = db.operations[order]
-    if (op.succeedsOrder >= 0) enq(op.succeedsOrder, type)
+    // if (op.succeedsOrder >= 0) enq(op.succeedsOrder, type)
     for (const p of op.parents) enq(p, type)
   }
 
   console.log('diff', aOut.map(order => getLocalVersion(db, order)), bOut.map(order => getLocalVersion(db, order)))
   return {aOut, bOut}
 }
-
-const localVersionCmp = (a: LocalVersion, b: LocalVersion) => (
-  a.agent === b.agent ? a.seq - b.seq : a.agent - b.agent
-)
 
 const vEq = (a: LocalVersion, b: LocalVersion) => a.agent === b.agent && a.seq === b.seq
 
@@ -243,20 +239,19 @@ const applyForwards = (db: DBState, op: RawOperation) => {
   assert(oldV == null || op.version.seq > oldV, "db already contains inserted operation")
 
   for (const {agent, seq} of op.parents) {
-    const dbSeq = db.version.get(agent)
-    assert(dbSeq! >= seq, "Cannot apply operation from the future")
-    assert(agent != op.version.agent, "Versions should not include self")
+    const dbSeq = db.version.get(agent)!
+    assert(dbSeq != null && dbSeq >= seq, "Cannot apply operation from the future")
 
-    const oldRefs = db.foreignRefs.get(agent, seq) ?? 0
-    db.foreignRefs.set(agent, seq, oldRefs + 1)
+    const oldRefs = db.refs.get(agent, seq) ?? 0
+    db.refs.set(agent, seq, oldRefs + 1)
 
     if (dbSeq === seq && oldRefs === 0) db.versionFrontier.delete(agent)
   }
   db.version.set(op.version.agent, op.version.seq)
   db.versionFrontier.add(op.version.agent)
 
-  // The operation might already be known in the database.
   let order = db.versionToOrder.get(op.version.agent, op.version.seq)
+  // We check becuase the operation might already be known in the database.
   if (order == null) {
     order = db.operations.length
     db.versionToOrder.set(op.version.agent, op.version.seq, order)
@@ -317,7 +312,7 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
 
   if (op.succeedsSeq != null) {
     db.version.set(op.version.agent, op.succeedsSeq)
-    if ((db.foreignRefs.get(op.version.agent, op.succeedsSeq) ?? 0) !== 0) {
+    if ((db.refs.get(op.version.agent, op.succeedsSeq) ?? 0) !== 0) {
       db.versionFrontier.delete(op.version.agent)
     }
   } else {
@@ -329,13 +324,12 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
     const dbSeq = db.version.get(agent)
     // console.log('dbseq', dbSeq, 'seq', seq)
     assert(dbSeq == null || dbSeq >= seq, "internal consistency error in versions")
-    assert(agent !== op.version.agent)
 
-    const newRefs = db.foreignRefs.get(agent, seq)! - 1
+    const newRefs = db.refs.get(agent, seq)! - 1
     assert(newRefs >= 0)
 
-    if (newRefs === 0) db.foreignRefs.delete(agent, seq) // Makes equals simpler.
-    else db.foreignRefs.set(agent, seq, newRefs)
+    if (newRefs === 0) db.refs.delete(agent, seq) // Makes equals simpler.
+    else db.refs.set(agent, seq, newRefs)
 
     if (newRefs === 0 && dbSeq === seq) db.versionFrontier.add(agent)
   }
@@ -390,10 +384,10 @@ const checkDb = (db: DBState) => {
   for (const [agent, seq] of db.version) {
     const isFrontier = db.versionFrontier.has(agent)
     if (isFrontier) {
-      assert.strictEqual(db.foreignRefs.get(agent, seq), undefined)
-      assert(db.foreignRefs.get(agent, seq) !== 0)
+      assert.strictEqual(db.refs.get(agent, seq), undefined)
+      assert(db.refs.get(agent, seq) !== 0)
     } else {
-      assert.notStrictEqual(db.foreignRefs.get(agent, seq) ?? 0, 0, "missing frontier element: " + agent)
+      assert.notStrictEqual(db.refs.get(agent, seq) ?? 0, 0, "missing frontier element: " + agent)
     }
   }
 
@@ -413,7 +407,7 @@ const checkDb = (db: DBState) => {
     
     for (const o of op.parents) {
       assert(o < order)
-      if (o > -1) assert.notStrictEqual(db.operations[o].version.agent, agent)
+      // if (o > -1) assert.notStrictEqual(db.operations[o].version.agent, agent)
     }
   }
 }
@@ -431,8 +425,7 @@ const randomOp = (db: DBState, ownedAgents: number[]): RawOperation => {
   // The parents of the operation are the current frontier set.
   // It'd be good to occasionally make a super old operation and throw that in too though.
   const parents: LocalVersion[] = Array.from(db.versionFrontier)
-  .filter(a => a !== agent)
-  .map((agent) => ({agent, seq: db.version.get(agent)!}))
+  .map(agent => ({agent, seq: db.version.get(agent)!}))
 
   const key = randItem(['a', 'b', 'c', 'd', 'e', 'f'])
   const docParents = getVal(db, key).map(({version}) => version)
@@ -466,7 +459,7 @@ const test = () => {
   let db: DBState = {
     data: new Map<string, DocValue>(),
     version: new Map<number, number>([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
-    foreignRefs: new Map2(),
+    refs: new Map2(),
     versionFrontier: new Set([ROOT_VERSION.agent]), // Kept in sorted order based on comparator.
     versionToOrder: new Map2(),
     operations: []
@@ -502,7 +495,7 @@ const test = () => {
       peerState.forEach(peer => {
         const localDb = cloneDb(db)
         const v1 = getOrderVersion(localDb)
-        console.log('db frontier', db.versionFrontier)
+        // console.log('db frontier', db.versionFrontier)
 
         peer.ops.forEach(op => {
           // console.log('apply forwards', localDb, op)
@@ -511,8 +504,8 @@ const test = () => {
         // console.log('->', localDb)
         assertDbEq(localDb, peer.db)
         const v2 = getOrderVersion(localDb)
-        console.log(peer.ops)
-        diff(localDb, v1, v2)
+        // console.log(peer.ops)
+        // diff(localDb, v1, v2)
         
         peer.ops.slice().reverse().forEach(op => {
           // console.log('apply backwards', localDb, op)
@@ -553,6 +546,24 @@ const test = () => {
     }
 
     db = final1
+
+    {
+      // Test diff
+
+      const fs = peerState.map(peer => (
+        Array.from(peer.db.versionFrontier).map(agent => (
+          agent === 0 ? -1 : db.versionToOrder.get(agent, db.version.get(agent)!)!
+        ))
+      ))
+
+      // console.log(peerState.map(p => p.db.versionFrontier))
+
+      console.log('fs', fs)
+
+      for (let i = 0; i < peerState.length; i++) {
+        diff(db, fs[i], fs[(i+1) % peerState.length])
+      }
+    }
 
     // // Make some operations from different peers
     // const op1: Operation = {
