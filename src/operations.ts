@@ -21,7 +21,7 @@ if (CHECK) console.log('running in checked mode')
 export interface RawOperation {
   version: LocalVersion, // These could be RawVersions.
   succeedsSeq: number | null,
-  parents: LocalVersion[], // This does not include the direct parent.
+  parents: LocalVersion[], // Only direct, non-transitive dependancies. May or may not include own agent's parent.
 
   docOps: DocOperation[],
 }
@@ -34,7 +34,7 @@ interface LocalOperation {
   // operations are concurrent they could end up in any order.
   order: number,
   succeedsOrder: number, // Or -1.
-  parents: number[] // localOrder of parents. Does not include direct parent.
+  parents: number[] // localOrder of parents. Semantics same as RawOperation.parents.
   docOps: DocOperation[],
 }
 
@@ -102,6 +102,10 @@ const getLocalOrder = (allOps: OperationSet, agent: number, seq: number): number
   agent === 0 && seq === 0 ? -1 : allOps.get(agent, seq)!
 )
 
+const getLocalVersion = (db: DBState, order: number) => (
+  order === -1 ? ROOT_VERSION : db.operations[order].version
+)
+
 const compareVersions = (db: DBState, a: LocalVersion, b: LocalVersion): number => {
   if (a.agent === b.agent) return a.seq - b.seq
 
@@ -152,13 +156,77 @@ const compareVersions = (db: DBState, a: LocalVersion, b: LocalVersion): number 
   else return 0
 }
 
-const diff = (allOps: OperationSet, a: LocalVersion[], b: LocalVersion[]) => {
-  // const aOnly = new Set
+const diff = (db: DBState, a: number[], b: number[]) => {
+  console.log('calculating difference between', a, b)
+  console.log('=', a.map(order => getLocalVersion(db, order)), b.map(order => getLocalVersion(db, order)))
+  // I'm going to try and work purely with order numbers here.
+  // const aOnly = new Set<number>(a)
+  // const bOnly = new Set<number>(b)
+
+  // Ok now aOnly and bOnly are strict subsets. The algorithm works by 
+
+  // There's a bunch of ways to implement this. I'm not sure this is the best.
+  const enum ItemType {
+    Shared, A, B
+  }
+  // type Item = {
+  //   type: ItemType,
+  //   order: number
+  // }
+
+  const itemType = new Map<number, ItemType>()
+
+  // Every order is in here at most once.
+  const queue = new PriorityQueue<number>()
+  
+  // Number of items in the queue in both transitive histories
+  let numShared = 0
+  // const queueItems = new Set<number>()
+
+  const enq = (order: number, type: ItemType) => {
+    const currentType = itemType.get(order)
+    if (currentType == null) {
+      queue.enq(order)
+      itemType.set(order, type)
+      console.log('+++ ', order, type, getLocalVersion(db, order))
+      if (type === ItemType.Shared) numShared++
+    } else if (type !== currentType && currentType !== ItemType.Shared) {
+      // This is sneaky. If the two types are different they have to be {A,B},
+      // {A,Shared} or {B,Shared}. In any of those cases the final result is
+      // Shared. If the current type isn't shared, set it as such.
+      itemType.set(order, ItemType.Shared)
+      numShared++
+    }
+  }
+
+  for (const order of a) enq(order, ItemType.A)
+  for (const order of b) enq(order, ItemType.B)
+
+  const aOut: number[] = [], bOut: number[] = []
+
+  // Loop until everything is shared.
+  while (queue.size() > numShared) {
+    const order = queue.deq()
+    const type = itemType.get(order)!
+    console.log('--- ', order, 'of type', type, getLocalVersion(db, order), 'shared', numShared, 'num', queue.size())
+    assert(type != null)
+
+    if (type === ItemType.Shared) numShared--
+    else (type === ItemType.A ? aOut : bOut).push(order)
+
+    if (order < 0) continue // Bottom out at the root operation.
+    const op = db.operations[order]
+    if (op.succeedsOrder >= 0) enq(op.succeedsOrder, type)
+    for (const p of op.parents) enq(p, type)
+  }
+
+  console.log('diff', aOut.map(order => getLocalVersion(db, order)), bOut.map(order => getLocalVersion(db, order)))
+  return {aOut, bOut}
 }
 
-// const localVersionCmp = (a: LocalVersion, b: LocalVersion) => (
-//   a.agent === b.agent ? a.seq - b.seq : a.agent - b.agent
-// )
+const localVersionCmp = (a: LocalVersion, b: LocalVersion) => (
+  a.agent === b.agent ? a.seq - b.seq : a.agent - b.agent
+)
 
 const vEq = (a: LocalVersion, b: LocalVersion) => a.agent === b.agent && a.seq === b.seq
 
@@ -381,12 +449,19 @@ const randomOp = (db: DBState, ownedAgents: number[]): RawOperation => {
   }
 }
 
+const getOrderVersion = (db: DBState): number[] => (
+  Array.from(db.versionFrontier).map(agent => (
+    agent === 0 ? -1 : db.versionToOrder.get(agent, db.version.get(agent)!)!
+  ))
+)
+
 const test = () => {
   // const numPeers = 1
   const numPeers = 3
   const numOpsPerIter = 10
   // const numOpsPerIter = 10
-  const numIterations = 300
+  const numIterations = 2
+  // const numIterations = 300
 
   let db: DBState = {
     data: new Map<string, DocValue>(),
@@ -426,6 +501,8 @@ const test = () => {
       // We should end up in the original state.
       peerState.forEach(peer => {
         const localDb = cloneDb(db)
+        const v1 = getOrderVersion(localDb)
+        console.log('db frontier', db.versionFrontier)
 
         peer.ops.forEach(op => {
           // console.log('apply forwards', localDb, op)
@@ -433,6 +510,9 @@ const test = () => {
         })
         // console.log('->', localDb)
         assertDbEq(localDb, peer.db)
+        const v2 = getOrderVersion(localDb)
+        console.log(peer.ops)
+        diff(localDb, v1, v2)
         
         peer.ops.slice().reverse().forEach(op => {
           // console.log('apply backwards', localDb, op)
@@ -452,6 +532,7 @@ const test = () => {
       // original state.
 
       const localDb = cloneDb(db)
+
       peerState.forEach(peer => {
         peer.ops.forEach(op => {
           applyForwards(localDb, op)
