@@ -1,9 +1,50 @@
-import { LocalValue, LocalVersion, ROOT_VERSION } from "./types"
+/**
+ * This is a simple example program showing a working in-memory database storing
+ * full history and branches. In this demo the "database" is a Map from string
+ * keys to values.
+ *
+ * Everything is versioned - you can wind time forward and backwards, and mark a
+ * branch and teleport the database back to that point in time.
+ *
+ * Conflicts are handled similarly to Basho's riak. When concurrent writes
+ * happen, the database stores every concurrent version of the document. A
+ * subsequent read will fetch all values, and a subsequent write can supercede
+ * all existing values to "solve" the conflict.
+ *
+ * For the most part I'm using a hybrid model between lamport timestamp version
+ * vectors and using implied versions via transitive dependancies. The idea is
+ * to allow arbitrary peers to write data (not limited to a "server pool" of
+ * writers). But still avoid sibling explosions by rarely actually naming the
+ * fully expanded version.
+ *
+ * At the bottom of the file is a fuzz test which creates 3 database peers then
+ * generates random operations to apply to them. Then random pairs of peers sync
+ * changes with one another. The whole database must stay consistent. The sync
+ * algorithm currently isn't written to work over a network - a proper protocol
+ * should also manage round-trips and whatnot, and ideally not take size linear
+ * with the number of agent IDs.
+ *
+ * The fuzz test is slower than I'd like because of deep cloning in the test and
+ * excessive comparisons (which grow linearly over time). A real database node
+ * should be much quicker.
+ */
+
 import assert from 'assert'
+import { Console } from "console"
 import seedrandom from 'seedrandom'
 import Map2 from 'map2'
-import { Console } from "console"
 import PriorityQueue from 'priorityqueuejs'
+
+// A simple version interface. Externally you'd want to use random uuids for
+// agent identifiers.
+export interface RawVerssion {
+  agent: number,
+  seq: number
+}
+
+export const ROOT_VERSION: RawVersion = {
+  agent: 0, seq: 0
+}
 
 const console = new Console({
   stdout: process.stdout,
@@ -18,15 +59,15 @@ if (CHECK) console.log('running in checked mode')
 
 // An operation affects multiple documents 
 export interface RawOperation {
-  version: LocalVersion, // These could be RawVersions.
+  version: RawVersion, // These could be RawVersions.
   succeedsSeq: number | null,
-  parents: LocalVersion[], // Only direct, non-transitive dependancies. May or may not include own agent's parent.
+  parents: RawVersion[], // Only direct, non-transitive dependancies. May or may not include own agent's parent.
 
   docOps: DocOperation[],
 }
 
 interface LocalOperation {
-  version: LocalVersion,
+  version: RawVersion,
 
   // This is filled in when an operation is added to the store. It is a local
   // order defined such that if a > b, a.localOrder > b.localOrder. If two
@@ -45,12 +86,12 @@ export interface DocOperation {
   // collection: string,
 
   // TODO: Change parents to a local order too.
-  parents: LocalVersion[], // Specific to the document. The named operations edit this doc.
+  parents: RawVersion[], // Specific to the document. The named operations edit this doc.
   newValue: any,
 }
 
 export type DocValue = { // Has multiple entries iff version in conflict.
-  version: LocalVersion,
+  version: RawVersion,
   value: any
 }[]
 
@@ -109,11 +150,11 @@ const getLocalVersion = (db: DBState, order: number) => (
   order === -1 ? ROOT_VERSION : db.operations[order].version
 )
 
-const vCmp = (a: LocalVersion, b: LocalVersion) => (
+const vCmp = (a: RawVersion, b: RawVersion) => (
   (a.agent - b.agent) || (a.seq - b.seq)
 )
 
-const compareVersions = (db: DBState, a: LocalVersion, b: LocalVersion): number => {
+const compareVersions = (db: DBState, a: RawVersion, b: RawVersion): number => {
   if (a.agent === b.agent) return a.seq - b.seq
 
   // This works is via a DFS from the operation with a higher localOrder looking
@@ -235,13 +276,13 @@ const diff = (db: DBState, a: number[], b: number[]) => {
   return {aOnly, bOnly}
 }
 
-const diffV = (db: DBState, a: LocalVersion[], b: LocalVersion[]) => {
+const diffV = (db: DBState, a: RawVersion[], b: RawVersion[]) => {
   const aOrder = a.map(v => getLocalOrder(db.versionToOrder, v.agent, v.seq))
   const bOrder = b.map(v => getLocalOrder(db.versionToOrder, v.agent, v.seq))
   return diff(db, aOrder, bOrder)
 }
 
-const vEq = (a: LocalVersion, b: LocalVersion) => a.agent === b.agent && a.seq === b.seq
+const vEq = (a: RawVersion, b: RawVersion) => a.agent === b.agent && a.seq === b.seq
 
 const getVal = (db: DBState, key: string): DocValue => (
   db.data.get(key) ?? [{
@@ -443,7 +484,7 @@ const randomOp = (db: DBState, ownedAgents: number[], iter: number): RawOperatio
 
   // The parents of the operation are the current frontier set.
   // It'd be good to occasionally make a super old operation and throw that in too though.
-  const parents: LocalVersion[] = Array.from(db.versionFrontier)
+  const parents: RawVersion[] = Array.from(db.versionFrontier)
   .map(agent => ({agent, seq: db.version.get(agent)!}))
 
   // The set of keys should always grow, but we'll make it grow slower as the run goes on.
@@ -471,7 +512,7 @@ const getOrderVersion = (db: DBState): number[] => (
 
 const cmp = (a: number, b: number) => a - b
 
-const getBranch = (db: DBState): LocalVersion[] => (
+const getBranch = (db: DBState): RawVersion[] => (
   Array.from(db.versionFrontier).map(agent => (
     {agent, seq: db.version.get(agent)!}
   ))
@@ -479,7 +520,7 @@ const getBranch = (db: DBState): LocalVersion[] => (
 
 // Branch specified as a frontier map - sparce agent => seq.
 // Returns original branch.
-const switchBranch = (db: DBState, branch: LocalVersion[]): LocalVersion[] => {
+const switchBranch = (db: DBState, branch: RawVersion[]): RawVersion[] => {
   const start = getBranch(db)
   const end = branch
 
@@ -495,7 +536,55 @@ const switchBranch = (db: DBState, branch: LocalVersion[]): LocalVersion[] => {
   return start
 }
 
-const test2 = () => {
+const syncPeers = (a: DBState, b: DBState) => {
+  // Sync a and b. Eventually this should use a proper network protocol, but
+  // for now this will do.
+  const onlyA = [], onlyB = []
+
+  const agents = new Set([...a.version.keys(), ...b.version.keys()])
+
+  const getOperationsFrom = (db: DBState, agent: number, seqStart: number, seqEnd: number | null) => {
+    const resultOrders: number[] = []
+    let order = getLocalOrder(db.versionToOrder, agent, seqStart)
+    let orderEnd = seqEnd == null ? -1 : getLocalOrder(db.versionToOrder, agent, seqEnd)
+
+    while (order > orderEnd) {
+      const op = db.operations[order]
+      assert(op != null)
+      resultOrders.push(order)
+      order = op.succeedsOrder
+    }
+    return resultOrders
+  }
+
+  for (let agent of agents) {
+    const aSeq = a.version.get(agent)
+    const bSeq = b.version.get(agent)
+    if (aSeq == bSeq) continue
+    assert(aSeq != null || bSeq != null) // Either they're both set or one is null.
+
+    const aBigger = bSeq == null || (aSeq! > bSeq)
+
+    if (aBigger) {
+      onlyA.push(...getOperationsFrom(a, agent, aSeq!, bSeq ?? null))
+    } else {
+      onlyB.push(...getOperationsFrom(b, agent, bSeq!, aSeq ?? null))
+    }
+  }
+  const onlyAOps = onlyA.sort(cmp).map(order => a.operations[order].raw)
+  const onlyBOps = onlyB.sort(cmp).map(order => b.operations[order].raw)
+
+  // console.log('syncing peers', aId, bId, 'distance:', onlyAOps.length, onlyBOps.length)
+
+  for (const op of onlyBOps) {
+    applyForwards(a, op)
+  }
+  for (const op of onlyAOps) {
+    applyForwards(b, op)
+  }
+}
+
+const test = () => {
   // const numPeers = 1
   const numPeers = 3
   const numOpsPerIter = 10
@@ -583,54 +672,9 @@ const test2 = () => {
 
       const [aHead, bHead] = [getBranch(a), getBranch(b)]
 
-      // Sync a and b. Eventually this should use a proper network protocol, but
-      // for now this will do.
-      const onlyA = [], onlyB = []
+      // Actually sync, bringing both a and b into alignment.
+      syncPeers(a, b)
 
-      const agents = new Set([...a.version.keys(), ...b.version.keys()])
-
-      const getOperationsFrom = (db: DBState, agent: number, seqStart: number, seqEnd: number | null) => {
-        const resultOrders: number[] = []
-        let order = getLocalOrder(db.versionToOrder, agent, seqStart)
-        let orderEnd = seqEnd == null ? -1 : getLocalOrder(db.versionToOrder, agent, seqEnd)
-
-        while (order > orderEnd) {
-          const op = db.operations[order]
-          assert(op != null)
-          resultOrders.push(order)
-          order = op.succeedsOrder
-        }
-        return resultOrders
-      }
-
-      for (let agent of agents) {
-        const aSeq = a.version.get(agent)
-        const bSeq = b.version.get(agent)
-        if (aSeq == bSeq) continue
-        assert(aSeq != null || bSeq != null) // Either they're both set or one is null.
-
-        const aBigger = bSeq == null || (aSeq! > bSeq)
-
-        if (aBigger) {
-          onlyA.push(...getOperationsFrom(a, agent, aSeq!, bSeq ?? null))
-        } else {
-          onlyB.push(...getOperationsFrom(b, agent, bSeq!, aSeq ?? null))
-        }
-      }
-      const onlyAOps = onlyA.sort(cmp).map(order => a.operations[order].raw)
-      const onlyBOps = onlyB.sort(cmp).map(order => b.operations[order].raw)
-
-      // console.log('syncing peers', aId, bId, 'distance:', onlyAOps.length, onlyBOps.length)
-
-      // console.log(peers[aId].iterOps)
-      // console.log(peers[bId].iterOps)
-      // console.log(aId, bId, onlyAOps, onlyBOps)
-      for (const op of onlyBOps) {
-        applyForwards(a, op)
-      }
-      for (const op of onlyAOps) {
-        applyForwards(b, op)
-      }
       assert.deepStrictEqual(a.version, b.version)
       assert.deepStrictEqual(a.versionFrontier, b.versionFrontier)
       assert.deepStrictEqual(a.data, b.data)
@@ -658,136 +702,4 @@ const test2 = () => {
   }
 }
 
-const test = () => {
-  // const numPeers = 1
-  const numPeers = 3
-  const numOpsPerIter = 10
-  // const numOpsPerIter = 10
-  const numIterations = 2
-  // const numIterations = 300
-
-  let db: DBState = {
-    data: new Map<string, DocValue>(),
-    version: new Map<number, number>([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
-    refs: new Map2(),
-    versionFrontier: new Set([ROOT_VERSION.agent]), // Kept in sorted order based on comparator.
-    versionToOrder: new Map2(),
-    operations: []
-  }
-  checkDb(db)
-
-  let nextAgent = 100
-  
-  for (let iter = 0; iter < numIterations; iter++) {
-    let peerState = new Array(numPeers).fill(null).map(() => ({
-      db: cloneDb(db),
-      ops: [] as RawOperation[]
-    }))
-
-    // console.log('db', db.data)
-    // Generate some random operations for the peers
-    for (let i = 0; i < numOpsPerIter; i++) {
-      const peerId = randomInt(peerState.length)
-      const peer = peerState[peerId]
-      const op = randomOp(peer.db, [peerId + 1, nextAgent++], iter)
-
-      // console.log(op)
-      applyForwards(peer.db, op)
-      peer.ops.push(op)
-    }
-
-    // console.dir(peerState, {depth: null})
-    
-
-    {
-      // From db, apply all the operations for each agent and rewind them again.
-      // We should end up in the original state.
-      peerState.forEach(peer => {
-        const localDb = cloneDb(db)
-        const v1 = getOrderVersion(localDb)
-        // console.log('db frontier', db.versionFrontier)
-
-        peer.ops.forEach(op => {
-          // console.log('apply forwards', localDb, op)
-          applyForwards(localDb, op)
-        })
-        // console.log('->', localDb)
-        assertDbEq(localDb, peer.db)
-        const v2 = getOrderVersion(localDb)
-        // console.log(peer.ops)
-        // diff(localDb, v1, v2)
-        
-        peer.ops.slice().reverse().forEach(op => {
-          // console.log('apply backwards', localDb, op)
-          applyBackwards(localDb, op)
-        })
-        // console.log('<-', localDb)
-        assertDbEq(localDb, db)
-      })
-    }
-
-    let final1
-
-    {
-      // Ok all the agents' ops look good. We'll apply them all to db, then
-      // unapply them in a different order from the total order we apply them
-      // in. Because the operations are concurrent, we should end up in the
-      // original state.
-
-      const localDb = cloneDb(db)
-
-      peerState.forEach(peer => {
-        peer.ops.forEach(op => {
-          applyForwards(localDb, op)
-        })
-      })
-
-      final1 = cloneDb(localDb)
-      // console.log('end state', final1)
-
-      peerState.forEach(peer => {
-        peer.ops.slice().reverse().forEach(op => {
-          // console.log('apply backwards', localDb, op)
-          applyBackwards(localDb, op)
-        })
-      })
-
-      assertDbEq(localDb, db)
-    }
-
-    db = final1
-
-    {
-      // Test diff
-
-      const fs = peerState.map(peer => (
-        Array.from(peer.db.versionFrontier).map(agent => (
-          agent === 0 ? -1 : db.versionToOrder.get(agent, db.version.get(agent)!)!
-        ))
-      ))
-
-      // console.log(peerState.map(p => p.db.versionFrontier))
-
-      console.log('fs', fs)
-
-      for (let i = 0; i < peerState.length; i++) {
-        diff(db, fs[i], fs[(i+1) % peerState.length])
-      }
-    }
-
-    // // Make some operations from different peers
-    // const op1: Operation = {
-    //   docOps: [],
-    //   parents: [ROOT_VERSION],
-    //   version: {seq: 0, agent: 1}
-    // }
-    // console.log(db)
-    // applyForwards(db, op1)
-
-    // console.log(db)
-    // applyBackwards(db, op1)
-    // console.log(db)
-  }
-}
-
-test2()
+test()
