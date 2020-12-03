@@ -698,9 +698,7 @@ const test = () => {
       // Actually sync, bringing both a and b into alignment.
       syncPeers(a, b)
 
-      assert.deepStrictEqual(a.version, b.version)
-      assert.deepStrictEqual(a.versionFrontier, b.versionFrontier)
-      assert.deepStrictEqual(a.data, b.data)
+      assertDbEq(a, b)
       checkDb(a)
       checkDb(b)
       
