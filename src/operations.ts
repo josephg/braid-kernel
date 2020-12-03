@@ -37,7 +37,7 @@ import PriorityQueue from 'priorityqueuejs'
 
 // A simple version interface. Externally you'd want to use random uuids for
 // agent identifiers.
-export interface RawVerssion {
+export interface RawVersion {
   agent: number,
   seq: number
 }
@@ -113,21 +113,6 @@ interface DBState {
   versionToOrder: OperationSet, // agent,seq => order.
 }
 
-const cloneDb = (db: DBState): DBState => ({
-  // Could also just use new[k] = new old[k].constructor(old[k]).
-  data: new Map(db.data),
-  version: new Map(db.version),
-
-  refs: new Map2(db.refs),
-  
-  versionFrontier: new Set(db.versionFrontier),
-
-  // operations: db.operations,
-  // versionToOrder: db.versionToOrder,
-  operations: db.operations.slice(),
-  versionToOrder: new Map2(db.versionToOrder),
-})
-
 const assertDbEq = (a: DBState, b: DBState) => {
   if (!CHECK) return
 
@@ -142,27 +127,35 @@ const assertDbEq = (a: DBState, b: DBState) => {
 // - B dominates A (return -ive)
 // - A and B are equal (not checked here)
 // - A and B are concurrent (return 0)
-const getLocalOrder = (allOps: OperationSet, agent: number, seq: number): number => (
+const versionToOrder = (allOps: OperationSet, agent: number, seq: number): number => (
   agent === 0 && seq === 0 ? -1 : allOps.get(agent, seq)!
 )
 
-const getLocalVersion = (db: DBState, order: number) => (
+const orderToVersion = (db: DBState, order: number): RawVersion => (
   order === -1 ? ROOT_VERSION : db.operations[order].version
 )
 
+// This is used to break ties between versions.
 const vCmp = (a: RawVersion, b: RawVersion) => (
   (a.agent - b.agent) || (a.seq - b.seq)
 )
 
+/**
+ * This method calculates whether two versions are concurrent, if a dominates b
+ * or if b dominates a.
+ *
+ * Returns +ive if a dominates b, -ive if b dominates a, or 0 if either the
+ * operations are the same or the operations are concurrent. It is the
+ * responsibility of the caller to differentiate these cases. (Via vCmp(a,b) === 0).
+ */
 const compareVersions = (db: DBState, a: RawVersion, b: RawVersion): number => {
   if (a.agent === b.agent) return a.seq - b.seq
 
   // This works is via a DFS from the operation with a higher localOrder looking
   // for the localOrder of the smaller operation.
 
-  const aOrder = getLocalOrder(db.versionToOrder, a.agent, a.seq)
-  // console.log(b.agent, b.seq)
-  const bOrder = getLocalOrder(db.versionToOrder, b.agent, b.seq)
+  const aOrder = versionToOrder(db.versionToOrder, a.agent, a.seq)
+  const bOrder = versionToOrder(db.versionToOrder, b.agent, b.seq)
   assert(aOrder !== bOrder) // Should have returned above in this case.
 
   const [start, target] = aOrder > bOrder ? [aOrder, bOrder] : [bOrder, aOrder]
@@ -198,12 +191,21 @@ const compareVersions = (db: DBState, a: RawVersion, b: RawVersion): number => {
 
   visit(start)
 
-  // Note its impossible for the operation with a smaller localOrder to dominate
-  // the op with a larger localOrder.
+  // Its impossible for the operation with a smaller localOrder to dominate the
+  // op with a larger localOrder.
   if (found) return aOrder - bOrder
   else return 0
 }
 
+/**
+ * This method takes in two versions (expressed as a fronteir in order numbers).
+ * And it returns the set of operations only appearing in the history of one
+ * version or the other.
+ *
+ * There are some helper methods below for getting the diff of two versions
+ * expressed using RawVersions (diffv) and methods for converting a
+ * db.versionFrontier into a compatible list of orders.
+ */
 const diff = (db: DBState, a: number[], b: number[]) => {
   // console.log('calculating difference between', a, b)
   // console.log('=', a.map(order => getLocalVersion(db, order)), b.map(order => getLocalVersion(db, order)))
@@ -277,8 +279,8 @@ const diff = (db: DBState, a: number[], b: number[]) => {
 }
 
 const diffV = (db: DBState, a: RawVersion[], b: RawVersion[]) => {
-  const aOrder = a.map(v => getLocalOrder(db.versionToOrder, v.agent, v.seq))
-  const bOrder = b.map(v => getLocalOrder(db.versionToOrder, v.agent, v.seq))
+  const aOrder = a.map(v => versionToOrder(db.versionToOrder, v.agent, v.seq))
+  const bOrder = b.map(v => versionToOrder(db.versionToOrder, v.agent, v.seq))
   return diff(db, aOrder, bOrder)
 }
 
@@ -291,6 +293,15 @@ const getVal = (db: DBState, key: string): DocValue => (
   }]
 )
 
+/**
+ * Apply an operation to the database, and move the current branch forward based
+ * on the operation's version.
+ *
+ * Note: It would be cleaner to separate this into two methods, one to ingest
+ * the operation and one to merge the operation's contents into the local
+ * database. (Ie, this does the equivalent of `git fetch` then `git merge`.
+ * These functions should be separated.)
+ */
 const applyForwards = (db: DBState, op: RawOperation) => {
   // The operation supercedes all the versions named in parents with version.
   let oldV = db.version.get(op.version.agent)
@@ -307,6 +318,9 @@ const applyForwards = (db: DBState, op: RawOperation) => {
   }
   db.version.set(op.version.agent, op.version.seq)
   db.versionFrontier.add(op.version.agent)
+
+  // *** The version metadata is now up to date. Add the raw operation to the
+  // database
 
   let order = db.versionToOrder.get(op.version.agent, op.version.seq)
   // We check becuase the operation might already be known in the database.
@@ -327,7 +341,7 @@ const applyForwards = (db: DBState, op: RawOperation) => {
   }
   db.operations[order] = localOp // Appends if necessary.
   
-  // Then apply document changes
+  // *** And apply the named changes to the data model in db.data.
   for (const {key, parents, newValue} of op.docOps) {
     const prevVals = getVal(db, key)
 
@@ -359,12 +373,19 @@ const applyForwards = (db: DBState, op: RawOperation) => {
       }
     }
 
+    // If there's multiple conflicting values, we keep them in version-sorted
+    // order to make db comparisons easier in the fuzzer.
     db.data.set(key, newVal.sort((a, b) => vCmp(a.version, b.version)))
   }
 
   checkDb(db)
 }
 
+/**
+ * This is the inverse of applyForwards above. It purges the operation from the
+ * data model and the version, but it does not prune the operation from the
+ * known set of operations.
+ */
 const applyBackwards = (db: DBState, op: RawOperation) => {
   // Version stuff
   assert(db.version.get(op.version.agent) === op.version.seq)
@@ -429,13 +450,12 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
     else db.data.set(key, newVals)
   }
 
-  // Not strictly necessary. Actually its tricky - I'd need to delete the
-  // versionToOrder entry and the operation out of the known set.
-  // db.versionToOrder.delete(op.version.agent, op.version.seq)
+  // Not done: Remove the operation itself from the db.operations set.
 
   checkDb(db)
 }
 
+// Verify the database is internally consistent.
 const checkDb = (db: DBState) => {
   if (!CHECK) return
 
@@ -536,17 +556,20 @@ const switchBranch = (db: DBState, branch: RawVersion[]): RawVersion[] => {
   return start
 }
 
+/**
+ * Sync a and b. Eventually this should not depend on the db.version field. It
+ * should instead generate a bloom filter or something of known versions and
+ * then use a proper network protocol to sync. But for now this is fine.
+ */
 const syncPeers = (a: DBState, b: DBState) => {
-  // Sync a and b. Eventually this should use a proper network protocol, but
-  // for now this will do.
   const onlyA = [], onlyB = []
 
   const agents = new Set([...a.version.keys(), ...b.version.keys()])
 
   const getOperationsFrom = (db: DBState, agent: number, seqStart: number, seqEnd: number | null) => {
     const resultOrders: number[] = []
-    let order = getLocalOrder(db.versionToOrder, agent, seqStart)
-    let orderEnd = seqEnd == null ? -1 : getLocalOrder(db.versionToOrder, agent, seqEnd)
+    let order = versionToOrder(db.versionToOrder, agent, seqStart)
+    let orderEnd = seqEnd == null ? -1 : versionToOrder(db.versionToOrder, agent, seqEnd)
 
     while (order > orderEnd) {
       const op = db.operations[order]
