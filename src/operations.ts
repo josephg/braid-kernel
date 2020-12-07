@@ -38,12 +38,12 @@ import PriorityQueue from 'priorityqueuejs'
 // A simple version interface. Externally you'd want to use random uuids for
 // agent identifiers.
 export interface RawVersion {
-  agent: number,
+  agent: string,
   seq: number
 }
 
 export const ROOT_VERSION: RawVersion = {
-  agent: 0, seq: 0
+  agent: 'ROOT', seq: 0
 }
 
 const console = new Console({
@@ -95,17 +95,17 @@ export type DocValue = { // Has multiple entries iff version in conflict.
   value: any
 }[]
 
-type OperationSet = Map2<number, number, number>
+type OperationSet = Map2<string, number, number>
 
 interface DBState {
   data: Map<string, DocValue>
 
   // Version information is all relative / related to the current branch.
-  version: Map<number, number> // Expanded for all agents.
+  version: Map<string, number> // Expanded for all agents.
   // The number of times each (agent, seq) is referenced by an operations
-  refs: Map2<number, number, number>
+  refs: Map2<string, number, number>
   // This contains every entry in version where foreignRefs is 0 (or equivalently undefined).
-  versionFrontier: Set<number> // set of agent ids
+  versionFrontier: Set<string> // set of agent ids
 
   // This stuff is not compared when we compare databases. This is not relative
   // to the current branch - a database will store all seen operations here.
@@ -127,8 +127,8 @@ const assertDbEq = (a: DBState, b: DBState) => {
 // - B dominates A (return -ive)
 // - A and B are equal (not checked here)
 // - A and B are concurrent (return 0)
-const versionToOrder = (allOps: OperationSet, agent: number, seq: number): number => (
-  agent === 0 && seq === 0 ? -1 : allOps.get(agent, seq)!
+const versionToOrder = (allOps: OperationSet, agent: string, seq: number): number => (
+  agent === ROOT_VERSION.agent && seq === 0 ? -1 : allOps.get(agent, seq)!
 )
 
 const orderToVersion = (db: DBState, order: number): RawVersion => (
@@ -137,7 +137,7 @@ const orderToVersion = (db: DBState, order: number): RawVersion => (
 
 // This is used to break ties between versions.
 const vCmp = (a: RawVersion, b: RawVersion) => (
-  (a.agent - b.agent) || (a.seq - b.seq)
+  a.agent.localeCompare(b.agent, 'en-US') || (a.seq - b.seq)
 )
 
 /**
@@ -496,7 +496,7 @@ const randomReal = seedrandom("hi")
 const randomInt = (max: number) => (randomReal.int32() + 0xffffffff) % max
 const randItem = <T>(arr: T[]): T => arr[randomInt(arr.length)]
 
-const randomOp = (db: DBState, ownedAgents: number[], iter: number): RawOperation => {
+const randomOp = (db: DBState, ownedAgents: string[], iter: number): RawOperation => {
   const agent = ownedAgents[randomInt(ownedAgents.length)]
   const oldVersion = db.version.get(agent)
   // We'll need to use the next sequence number from the current state
@@ -526,7 +526,7 @@ const randomOp = (db: DBState, ownedAgents: number[], iter: number): RawOperatio
 
 const getOrderVersion = (db: DBState): number[] => (
   Array.from(db.versionFrontier).map(agent => (
-    agent === 0 ? -1 : db.versionToOrder.get(agent, db.version.get(agent)!)!
+    agent === ROOT_VERSION.agent ? -1 : db.versionToOrder.get(agent, db.version.get(agent)!)!
   ))
 )
 
@@ -566,7 +566,7 @@ const syncPeers = (a: DBState, b: DBState) => {
 
   const agents = new Set([...a.version.keys(), ...b.version.keys()])
 
-  const getOperationsFrom = (db: DBState, agent: number, seqStart: number, seqEnd: number | null) => {
+  const getOperationsFrom = (db: DBState, agent: string, seqStart: number, seqEnd: number | null) => {
     const resultOrders: number[] = []
     let order = versionToOrder(db.versionToOrder, agent, seqStart)
     let orderEnd = seqEnd == null ? -1 : versionToOrder(db.versionToOrder, agent, seqEnd)
@@ -618,13 +618,13 @@ const test = () => {
   const peers = new Array(numPeers).fill(null).map(() => ({
     db: <DBState>{
       data: new Map<string, DocValue>(),
-      version: new Map<number, number>([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
+      version: new Map([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
       refs: new Map2(),
       versionFrontier: new Set([ROOT_VERSION.agent]), // Kept in sorted order based on comparator.
       versionToOrder: new Map2(),
       operations: []
     },
-    iterStartV: new Map<number, number>(),
+    iterStartV: new Map<string, number>(),
     iterStartData: new Map<string, DocValue>(),
     iterOps: <RawOperation[]>[] // Operations this iteration
   }))
@@ -648,7 +648,7 @@ const test = () => {
     for (let i = 0; i < numOpsPerIter; i++) {
       const peerId = randomInt(peers.length)
       const peer = peers[peerId]
-      const op = randomOp(peer.db, [peerId + 1, nextAgent++], iter)
+      const op = randomOp(peer.db, [`P_${peerId + 1}`, `P_${peerId + 1}_${nextAgent++}`], iter)
 
       // console.log(op)
       applyForwards(peer.db, op)
