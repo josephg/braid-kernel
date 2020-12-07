@@ -37,12 +37,12 @@ import PriorityQueue from 'priorityqueuejs'
 
 // A simple version interface. Externally you'd want to use random uuids for
 // agent identifiers.
-export interface RawVersion {
+interface RawVersion {
   agent: string,
   seq: number
 }
 
-export const ROOT_VERSION: RawVersion = {
+const ROOT_VERSION: RawVersion = {
   agent: 'ROOT', seq: 0
 }
 
@@ -58,7 +58,7 @@ const CHECK = process.env['NOCHECK'] ? false : true
 if (CHECK) console.log('running in checked mode')
 
 // An operation affects multiple documents 
-export interface RawOperation {
+interface RawOperation {
   version: RawVersion, // These could be RawVersions.
   succeedsSeq: number | null,
   parents: RawVersion[], // Only direct, non-transitive dependancies. May or may not include own agent's parent.
@@ -81,7 +81,7 @@ interface LocalOperation {
   raw: RawOperation,
 }
 
-export interface DocOperation {
+interface DocOperation {
   key: string,
   // collection: string,
 
@@ -90,7 +90,7 @@ export interface DocOperation {
   newValue: any,
 }
 
-export type DocValue = { // Has multiple entries iff version in conflict.
+type DocValue = { // Has multiple entries iff version in conflict.
   version: RawVersion,
   value: any
 }[]
