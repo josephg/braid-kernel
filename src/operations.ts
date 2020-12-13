@@ -140,39 +140,33 @@ const vCmp = (a: RawVersion, b: RawVersion) => (
   a.agent.localeCompare(b.agent, 'en-US') || (a.seq - b.seq)
 )
 
-/**
- * This method calculates whether two versions are concurrent, if a dominates b
- * or if b dominates a.
- *
- * Returns +ive if a dominates b, -ive if b dominates a, or 0 if either the
- * operations are the same or the operations are concurrent. It is the
- * responsibility of the caller to differentiate these cases. (Via vCmp(a,b) === 0).
- */
-const compareVersions = (db: DBState, a: RawVersion, b: RawVersion): number => {
-  if (a.agent === b.agent) return a.seq - b.seq
+const numCmp = (a: number, b: number) => a - b
+
+// Parameters passed as orders.
+const branchContainsVersion = (db: DBState, target: number, branch: number[]): boolean => {
+  // TODO: Might be worth checking if the target version has the same agent id
+  // as one of the items in the branch and short circuiting if so.
+
+  if (branch.indexOf(target) >= 0) return true
 
   // This works is via a DFS from the operation with a higher localOrder looking
   // for the localOrder of the smaller operation.
-
-  const aOrder = versionToOrder(db.versionToOrder, a.agent, a.seq)
-  const bOrder = versionToOrder(db.versionToOrder, b.agent, b.seq)
-  assert(aOrder !== bOrder) // Should have returned above in this case.
-
-  const [start, target] = aOrder > bOrder ? [aOrder, bOrder] : [bOrder, aOrder]
 
   const visited = new Set<number>() // Set of localOrders.
 
   let found = false
 
   const visit = (order: number) => {
+    if (found) return
+
     // iter2++
     // console.log('visiting', agent, seq)
-    
-    if (order === target) {
-      found = true
+
+    if (order <= target) {
+      if (order === target) found = true
       return
-    } else if (order < target) { return }
-    
+    }
+
     const op = db.operations[order]
     assert(op != null)
 
@@ -184,17 +178,28 @@ const compareVersions = (db: DBState, a: RawVersion, b: RawVersion): number => {
     if (op.succeedsOrder > -1) visit(op.succeedsOrder)
 
     for (const p of op.parents) {
-      if (found) return
+      if (found) return // redundant
       visit(p)
     }
   }
 
-  visit(start)
+  // Start with the smallest number.
+  for (const o of branch.sort(numCmp)) visit(o)
+  return found
+}
+
+const compareVersions = (db: DBState, a: RawVersion, b: RawVersion): number => {
+  if (a.agent === b.agent) return a.seq - b.seq
+  const aOrder = versionToOrder(db.versionToOrder, a.agent, a.seq)
+  const bOrder = versionToOrder(db.versionToOrder, b.agent, b.seq)
+  assert(aOrder !== bOrder) // Should have returned above in this case.
+
+  const [start, target] = aOrder > bOrder ? [aOrder, bOrder] : [bOrder, aOrder]
 
   // Its impossible for the operation with a smaller localOrder to dominate the
   // op with a larger localOrder.
-  if (found) return aOrder - bOrder
-  else return 0
+  return branchContainsVersion(db, target, [start])
+    ? aOrder - bOrder : 0
 }
 
 /**
@@ -612,7 +617,7 @@ const test = () => {
   const numPeers = 3
   const numOpsPerIter = 10
   // const numOpsPerIter = 10
-  const numIterations = 2000
+  const numIterations = 500
   // const numIterations = 300
 
   const peers = new Array(numPeers).fill(null).map(() => ({
