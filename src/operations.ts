@@ -30,7 +30,7 @@
  */
 
 import assert from 'assert'
-import { Console } from "console"
+// import { Console } from "console"
 import seedrandom from 'seedrandom'
 import Map2 from 'map2'
 import PriorityQueue from 'priorityqueuejs'
@@ -46,15 +46,16 @@ const ROOT_VERSION: RawVersion = {
   agent: 'ROOT', seq: 0
 }
 
-const console = new Console({
-  stdout: process.stdout,
-  stderr: process.stderr,
-  inspectOptions: {
-    depth: null
-  }
-})
+// const console = new Console({
+//   stdout: process.stdout,
+//   stderr: process.stderr,
+//   inspectOptions: {
+//     depth: null
+//   }
+// })
 
 const CHECK = process.env['NOCHECK'] ? false : true
+// const CHECK = false
 if (CHECK) console.log('running in checked mode')
 
 // An operation affects multiple documents 
@@ -103,7 +104,7 @@ interface DBState {
   // Version information is all relative / related to the current branch.
   version: Map<string, number> // Expanded for all agents.
   // The number of times each (agent, seq) is referenced by an operations
-  refs: Map2<string, number, number>
+
   // This contains every entry in version where foreignRefs is 0 (or equivalently undefined).
   versionFrontier: Set<string> // set of agent ids
 
@@ -118,7 +119,6 @@ const assertDbEq = (a: DBState, b: DBState) => {
 
   assert.deepStrictEqual(a.data, b.data)
   assert.deepStrictEqual(a.version, b.version)
-  assert.deepStrictEqual(a.refs, b.refs)
   assert.deepStrictEqual(a.versionFrontier, b.versionFrontier)
 }
 
@@ -148,6 +148,8 @@ const branchContainsVersion = (db: DBState, target: number, branch: number[]): b
   // as one of the items in the branch and short circuiting if so.
 
   if (branch.indexOf(target) >= 0) return true
+  if (branch.length === 0) return false
+  if (target === -1) return true
 
   // This works is via a DFS from the operation with a higher localOrder looking
   // for the localOrder of the smaller operation.
@@ -156,35 +158,32 @@ const branchContainsVersion = (db: DBState, target: number, branch: number[]): b
 
   let found = false
 
-  const visit = (order: number) => {
-    if (found) return
+  // LIFO queue. We could use a priority queue here but I'm not sure it'd be any
+  // faster in practice.
+  const queue: number[] = branch.slice().sort((a, b) => b - a) // descending.
 
-    // iter2++
-    // console.log('visiting', agent, seq)
+  while (queue.length > 0 && !found) {
+    const order = queue.pop()!
 
     if (order <= target) {
       if (order === target) found = true
-      return
+      continue
     }
 
-    const op = db.operations[order]
-    assert(op != null)
-
-    if (visited.has(order)) return
+    if (visited.has(order)) continue
     visited.add(order)
 
-    assert(op) // If we hit the root operation, we should have already returned.
-
-    if (op.succeedsOrder > -1) visit(op.succeedsOrder)
+    const op = db.operations[order]
+    assert(op != null) // If we hit the root operation, we should have already returned.
 
     for (const p of op.parents) {
-      if (found) return // redundant
-      visit(p)
+      queue.push(p)
     }
+
+    // Ordered so we hit this next.
+    if (op.succeedsOrder > -1) queue.push(op.succeedsOrder)
   }
 
-  // Start with the smallest number.
-  for (const o of branch.sort(numCmp)) visit(o)
   return found
 }
 
@@ -316,10 +315,7 @@ const applyForwards = (db: DBState, op: RawOperation) => {
     const dbSeq = db.version.get(agent)!
     assert(dbSeq != null && dbSeq >= seq, "Cannot apply operation from the future")
 
-    const oldRefs = db.refs.get(agent, seq) ?? 0
-    db.refs.set(agent, seq, oldRefs + 1)
-
-    if (dbSeq === seq && oldRefs === 0) db.versionFrontier.delete(agent)
+    if (dbSeq === seq) db.versionFrontier.delete(agent)
   }
   db.version.set(op.version.agent, op.version.seq)
   db.versionFrontier.add(op.version.agent)
@@ -360,7 +356,7 @@ const applyForwards = (db: DBState, op: RawOperation) => {
     // We'll check ancestry. Every parent of this operation (parents) must
     // either be represented directly in prevVals or be dominated of one of
     // them.
-    for (const v of parents) {
+    if (CHECK) for (const v of parents) {
       const exists = !!prevVals.find(({version: v2}) => vEq(v, v2))
       if (!exists) {
         // console.log('Checking ancestry')
@@ -398,26 +394,29 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
 
   if (op.succeedsSeq != null) {
     db.version.set(op.version.agent, op.succeedsSeq)
-    if ((db.refs.get(op.version.agent, op.succeedsSeq) ?? 0) !== 0) {
-      db.versionFrontier.delete(op.version.agent)
-    }
+
+    // if ((db.refs.get(op.version.agent, op.succeedsSeq) ?? 0) !== 0) {
+      // db.versionFrontier.delete(op.version.agent)
+    // }
   } else {
     db.version.delete(op.version.agent)
-    db.versionFrontier.delete(op.version.agent)
+    // db.versionFrontier.delete(op.version.agent)
   }
+
+  // We'll add it back below if we need to.
+  db.versionFrontier.delete(op.version.agent)
+
+  const orderBranch = getBranchAsOrders(db, db.versionFrontier)
 
   for (const {agent, seq} of op.parents) {
     const dbSeq = db.version.get(agent)
     // console.log('dbseq', dbSeq, 'seq', seq)
     assert(dbSeq == null || dbSeq >= seq, "internal consistency error in versions")
 
-    const newRefs = db.refs.get(agent, seq)! - 1
-    assert(newRefs >= 0)
-
-    if (newRefs === 0) db.refs.delete(agent, seq) // Makes equals simpler.
-    else db.refs.set(agent, seq, newRefs)
-
-    if (newRefs === 0 && dbSeq === seq) db.versionFrontier.add(agent)
+    const parentOrder = versionToOrder(db.versionToOrder, agent, seq)
+    if (!branchContainsVersion(db, parentOrder, orderBranch)) {
+      db.versionFrontier.add(agent)
+    }
   }
 
   // Ok now update the data.
@@ -429,14 +428,16 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
     // - All the objects named in parents that aren't superceded by another
     //   document version
     const newVals = prevVals.filter(({version}) => !vEq(version, op.version))
-    // console.log('prevVals', prevVals)
-    // And append all the parents that aren't dominated by another value.
+    // console.log('prevVals', prevVals.length, newVals.length)
+
+    // And add back all the parents that aren't dominated by another value in
+    // the operation.
     for (const p of parents) {
       // TODO: Assert p not already represented in prevVals, which would be invalid.
 
       // If p is dominated by a value in prevVals, skip.
       const dominated = newVals.map(({version}) => compareVersions(db, p, version))
-      if (dominated.findIndex(x => x < 0) >= 0) continue
+      if (dominated.some(x => x < 0)) continue
 
       if (vEq(p, ROOT_VERSION)) {
         assert(newVals.length === 0)
@@ -464,16 +465,14 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
 const checkDb = (db: DBState) => {
   if (!CHECK) return
 
-  // The frontier entries should always be at the current version
-  // console.log('checkdb', db)
-  for (const [agent, seq] of db.version) {
-    const isFrontier = db.versionFrontier.has(agent)
-    if (isFrontier) {
-      assert.strictEqual(db.refs.get(agent, seq), undefined)
-      assert(db.refs.get(agent, seq) !== 0)
-    } else {
-      assert.notStrictEqual(db.refs.get(agent, seq) ?? 0, 0, "missing frontier element: " + agent)
-    }
+  // The frontier should always be minimal - which is to say, all entries in the
+  // frontier are mutually concurrent. None of them are transitive parents of
+  // other entries.
+  const frontierOrders = getBranchAsOrders(db)
+  for (let i = 0; i < frontierOrders.length; i++) {
+    const trimmed = frontierOrders.slice()
+    const v = trimmed.splice(i, 1)[0]
+    assert(!branchContainsVersion(db, v, trimmed))
   }
 
   // Scan all the operations. For each operation with parents, those parents
@@ -501,8 +500,7 @@ const randomReal = seedrandom("hi")
 const randomInt = (max: number) => (randomReal.int32() + 0xffffffff) % max
 const randItem = <T>(arr: T[]): T => arr[randomInt(arr.length)]
 
-const randomOp = (db: DBState, ownedAgents: string[], iter: number): RawOperation => {
-  const agent = ownedAgents[randomInt(ownedAgents.length)]
+const randomOp = (db: DBState, agent: string, iter: number): RawOperation => {
   const oldVersion = db.version.get(agent)
   // We'll need to use the next sequence number from the current state
   const seq = oldVersion == null ? 1 : oldVersion + 1
@@ -529,16 +527,16 @@ const randomOp = (db: DBState, ownedAgents: string[], iter: number): RawOperatio
   }
 }
 
-const getOrderVersion = (db: DBState): number[] => (
-  Array.from(db.versionFrontier).map(agent => (
+const getBranchAsOrders = (db: DBState, frontier: Set<string> = db.versionFrontier): number[] => (
+  Array.from(frontier).map(agent => (
     agent === ROOT_VERSION.agent ? -1 : db.versionToOrder.get(agent, db.version.get(agent)!)!
   ))
 )
 
 const cmp = (a: number, b: number) => a - b
 
-const getBranch = (db: DBState): RawVersion[] => (
-  Array.from(db.versionFrontier).map(agent => (
+const getBranch = (db: DBState, frontier: Set<string> = db.versionFrontier): RawVersion[] => (
+  Array.from(frontier).map(agent => (
     {agent, seq: db.version.get(agent)!}
   ))
 )
@@ -617,31 +615,37 @@ const test = () => {
   const numPeers = 3
   const numOpsPerIter = 10
   // const numOpsPerIter = 10
-  const numIterations = 500
+  const numIterations = CHECK ? 1000 : 30000
   // const numIterations = 300
 
-  const peers = new Array(numPeers).fill(null).map(() => ({
+  const peers = new Array(numPeers).fill(null).map((_, i) => ({
     db: <DBState>{
       data: new Map<string, DocValue>(),
       version: new Map([[ROOT_VERSION.agent, ROOT_VERSION.seq]]), // Expanded for all agents
-      refs: new Map2(),
       versionFrontier: new Set([ROOT_VERSION.agent]), // Kept in sorted order based on comparator.
       versionToOrder: new Map2(),
       operations: []
     },
     iterStartV: new Map<string, number>(),
     iterStartData: new Map<string, DocValue>(),
-    iterOps: <RawOperation[]>[] // Operations this iteration
+    iterOps: <RawOperation[]>[], // Operations this iteration
+    currentAgent: `P_${i + 1}`
   }))
 
   let nextAgent = 100
 
   for (let iter = 0; iter < numIterations; iter++) {
-    if ((iter % 100) == 0) console.log('***** ITER', iter)
-    for (const peer of peers) {
-      peer.iterStartV = new Map(peer.db.version)
-      peer.iterStartData = new Map(peer.db.data)
+    for (let i = 0; i < peers.length; i++) {
+      const peer = peers[i]
+      if (CHECK) {
+        peer.iterStartV = new Map(peer.db.version)
+        peer.iterStartData = new Map(peer.db.data)
+      }
       peer.iterOps.length = 0
+
+      if (randomInt(100) == 0) {
+        peer.currentAgent = `P_${i + 1}_${nextAgent++}`
+      }
     }
 
     // const startVersion = new Map(peers[0].db.version)
@@ -653,7 +657,8 @@ const test = () => {
     for (let i = 0; i < numOpsPerIter; i++) {
       const peerId = randomInt(peers.length)
       const peer = peers[peerId]
-      const op = randomOp(peer.db, [`P_${peerId + 1}`, `P_${peerId + 1}_${nextAgent++}`], iter)
+      const op = randomOp(peer.db, peer.currentAgent, iter)
+      // const op = randomOp(peer.db, [`P_${peerId + 1}`, `P_${peerId + 1}_${nextAgent++}`], iter)
 
       // console.log(op)
       applyForwards(peer.db, op)
@@ -665,30 +670,34 @@ const test = () => {
     // For each peer, rewind the newly created operations and reapply them.
     for (const peer of peers) {
       const finalVersion = new Map(peer.db.version)
-      const finalFrontierOrder = getOrderVersion(peer.db)
+      const finalFrontierOrder = getBranchAsOrders(peer.db)
 
       peer.iterOps.slice().reverse().forEach(op => {
         applyBackwards(peer.db, op)
       })
-      assert.deepStrictEqual(peer.db.version, peer.iterStartV)
-      assert.deepStrictEqual(peer.db.data, peer.iterStartData)
-      const initialFrontierOrder = getOrderVersion(peer.db)
+      if (CHECK) {
+        assert.deepStrictEqual(peer.db.version, peer.iterStartV)
+        assert.deepStrictEqual(peer.db.data, peer.iterStartData)
+      }
+      const initialFrontierOrder = getBranchAsOrders(peer.db)
 
       peer.iterOps.forEach(op => {
         applyForwards(peer.db, op)
       })
-      assert.deepStrictEqual(peer.db.version, finalVersion)
+      // assert.deepStrictEqual(peer.db.version, finalVersion)
 
       // The difference between startVersion and finalVersion should just be the
       // operations.
       const {aOnly, bOnly} = diff(peer.db, initialFrontierOrder, finalFrontierOrder)
-      assert.strictEqual(aOnly.length, 0)
-      assert.strictEqual(bOnly.length, peer.iterOps.length)
-      const bVersions = bOnly.map(order => peer.db.operations[order].version).reverse()
-      const peerVersions = peer.iterOps.map(op => op.version)
-      assert.deepStrictEqual(bVersions, peerVersions)
+      if (CHECK) {
+        assert.strictEqual(aOnly.length, 0)
+        assert.strictEqual(bOnly.length, peer.iterOps.length)
+        const bVersions = bOnly.map(order => peer.db.operations[order].version).reverse()
+        const peerVersions = peer.iterOps.map(op => op.version)
+        assert.deepStrictEqual(bVersions, peerVersions)
 
-      checkDb(peer.db)
+        checkDb(peer.db)
+      }
     }
 
     // We'll pick a random pair of peers and synchronize them.
@@ -708,7 +717,7 @@ const test = () => {
       checkDb(b)
       
       const mergeHead = getBranch(a)
-      
+
       // console.log('merge', mergeHead, aHead, bHead)
 
       // So we should be able to bounce between branches now.
@@ -725,7 +734,12 @@ const test = () => {
       assertDbEq(a, b)
     }
 
+    if (((iter+1) % (CHECK ? 100 : 1000)) == 0) console.log('***** ITER', (iter+1))
   }
 }
 
+// export default test
+
+;(globalThis as any).test = test
 test()
+// console.log('iter', iter, maxDepth)
