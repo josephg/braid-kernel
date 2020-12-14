@@ -20,7 +20,7 @@
  *   stuff. I'll think about this later.
  */
 
-import {open as lmdbOpen, Database} from 'lmdb-store'
+import {open as lmdbOpen, Database, RootDatabase} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
 import {LocalOperation, RemoteVersion, RemoteOperation, ROOT_VERSION, DocId, DocValue} from './types'
 import { getLastKey, keyInc } from './util'
@@ -30,10 +30,19 @@ import assert from 'assert'
 const DEEPCHECK = true
 if (DEEPCHECK) console.log('running in checked mode')
 
+export type View = Database // I'll probably add more fields here eventually.
 
 export interface Db {
   ops: Database, // All operations ever.
-  data: Database // Might be worth having multiple of this.
+  views: {[k: string]: Database},
+
+  _root: RootDatabase
+}
+
+const assertType = (db: Database, type: string) => {
+  const actualType = db.get(typeKey)
+  if (actualType == null) db.putSync(typeKey, type)
+  else assert.strictEqual(actualType, type)
 }
 
 export function open(): Db {
@@ -44,10 +53,23 @@ export function open(): Db {
 
   // Two databases - one with all the operations:
   const ops = root.openDB('ops', {keyIsBuffer: true})
+  assertType(ops, 'ops')
   // And another with a snapshot of the data at some point in time:
-  const data = root.openDB('data', {keyIsBuffer: true})
+  // const data = root.openDB('data', {keyIsBuffer: true})
 
-  return {ops, data}
+  return {ops, views: {}, _root: root}
+}
+
+export function openView(db: Db, viewName: string): Database {
+  if (db.views[viewName] != null) return db.views[viewName]
+  else {
+    assert(viewName != 'ops', 'Reserved view name')
+    const view = db._root.openDB(viewName, {keyIsBuffer: true})
+    assertType(view, 'view')
+
+    db.views[viewName] = view
+    return view
+  }
 }
 
 // *** Operations ***
@@ -70,6 +92,7 @@ const getOrderForVersionKey = (version: RemoteVersion) => pack(['order', version
 // *** Document database
 const getDocKey = (id: DocId) => pack(['doc', ...id])
 const branchKey = pack('branch') // Contains a list of orders.
+const typeKey = pack('db type')
 
 // Get the highest known sequence number for the specified agent. Returns -1 if none found.
 const getMaxSeq = (db: Db, agent: string): number | null => {
@@ -232,24 +255,24 @@ const checkOps = (db: Db) => {
 
 
 
-export function getVal(db: Db, key: DocId): DocValue {
+export function getVal(view: View, key: DocId): DocValue {
   // Every document implicitly exists, but with a value of null.
-  return (db.data.get(getDocKey(key)) as DocValue | null) ?? [{
+  return (view.get(getDocKey(key)) as DocValue | null) ?? [{
     order: -1,
     value: null
   }]
 }
 
-export function getBranch(db: Db): number[] {
-  return (db.data.get(branchKey) as number[]) ?? [-1]
+export function getBranch(view: View): number[] {
+  return (view.get(branchKey) as number[]) ?? [-1]
 }
 
 // Returns new branch.
-export function applyForwards(db: Db, order: number): number[] {
+export function applyForwards(db: Db, view: View, order: number): number[] {
   // This method is often called after addOperation - in which case it might
   // make more sense to take the LocalOperation itself as an argument.
   const op = getOperation(db, order)
-  const oldBranch = getBranch(db)
+  const oldBranch = getBranch(view)
 
   // Check the operation fits. The operation should not be in the branch, but
   // all the operation's parents should be.
@@ -267,10 +290,10 @@ export function applyForwards(db: Db, order: number): number[] {
   ]
   // This feels a little fragile because I don't know how lmdb-store handles
   // exceptions during a transaction.
-  db.data.put(branchKey, newBranch)
+  view.put(branchKey, newBranch)
 
   for (const {id, parents, opData} of op.docOps) {
-    const prevVals = getVal(db, id)
+    const prevVals = getVal(view, id)
 
     // The doc op's parents field contains a subset of the versions present in
     // oldVal.
@@ -302,15 +325,15 @@ export function applyForwards(db: Db, order: number): number[] {
     // If there's multiple conflicting values, we keep them in version-sorted
     // order to make db comparisons easier in the fuzzer.
     newVal.sort((a, b) => a.order - b.order)
-    db.data.put(getDocKey(id), newVal)
+    view.put(getDocKey(id), newVal)
   }
 
   return newBranch
 }
 
-export function applyBackwards(db: Db, order: number): number[] {
+export function applyBackwards(db: Db, view: View, order: number): number[] {
   const op = getOperation(db, order)
-  const branch = getBranch(db)
+  const branch = getBranch(view)
 
   // Remove the operation from the frontier.
   const idx = branch.indexOf(order)
@@ -326,11 +349,11 @@ export function applyBackwards(db: Db, order: number): number[] {
     }
   }
 
-  db.data.put(branchKey, branch)
+  view.put(branchKey, branch)
 
   // And update the data.
   for (const {id, parents} of op.docOps) {
-    const prevVals = getVal(db, id)
+    const prevVals = getVal(view, id)
 
     // The values should instead contain:
     // - Everything in prevVals not including op.version
@@ -363,8 +386,8 @@ export function applyBackwards(db: Db, order: number): number[] {
 
     console.log('newVals', newVals)
     // This is a bit dirty, to handle the root.
-    if (newVals.length === 0) db.data.remove(getDocKey(id))
-    else db.data.put(getDocKey(id), newVals)
+    if (newVals.length === 0) view.remove(getDocKey(id))
+    else view.put(getDocKey(id), newVals)
   }
 
   return branch
@@ -372,7 +395,9 @@ export function applyBackwards(db: Db, order: number): number[] {
 
 const test = async () => {
   const db = open()
-  console.log('branch', getBranch(db))
+  const view = openView(db, 'stuff')
+  console.log('branch', getBranch(view))
+
   const order = await db.ops.transaction(() => {
     const order = addOperation(db, {
       version: {
@@ -390,19 +415,19 @@ const test = async () => {
       }],
     })
 
-    applyForwards(db, order)
+    applyForwards(db, view, order)
     return order
   })
   checkOps(db)
-  console.log('branch', getBranch(db))
-  console.log(getVal(db, ['posts', 'yo']))
+  console.log('branch', getBranch(view))
+  console.log(getVal(view, ['posts', 'yo']))
 
-  await db.data.transaction(() => {
-    applyBackwards(db, order)
+  await view.transaction(() => {
+    applyBackwards(db, view, order)
   })
 
   checkOps(db)
-  console.log('branch', getBranch(db))
-  console.log(getVal(db, ['posts', 'yo']))
+  console.log('branch', getBranch(view))
+  console.log(getVal(view, ['posts', 'yo']))
 }
 test()
