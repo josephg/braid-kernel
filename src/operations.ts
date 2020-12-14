@@ -127,8 +127,11 @@ const assertDbEq = (a: DBState, b: DBState) => {
 // - B dominates A (return -ive)
 // - A and B are equal (not checked here)
 // - A and B are concurrent (return 0)
-const versionToOrder = (allOps: OperationSet, agent: string, seq: number): number => (
-  agent === ROOT_VERSION.agent && seq === 0 ? -1 : allOps.get(agent, seq)!
+const versionToOrder2 = (db: DBState, agent: string, seq: number): number => (
+  agent === ROOT_VERSION.agent && seq === 0 ? -1 : db.versionToOrder.get(agent, seq)!
+)
+const versionToOrder = (db: DBState, {agent, seq}: RawVersion): number => (
+  agent === ROOT_VERSION.agent && seq === 0 ? -1 : db.versionToOrder.get(agent, seq)!
 )
 
 const orderToVersion = (db: DBState, order: number): RawVersion => (
@@ -176,9 +179,7 @@ const branchContainsVersion = (db: DBState, target: number, branch: number[]): b
     const op = db.operations[order]
     assert(op != null) // If we hit the root operation, we should have already returned.
 
-    for (const p of op.parents) {
-      queue.push(p)
-    }
+    queue.push(...op.parents)
 
     // Ordered so we hit this next.
     if (op.succeedsOrder > -1) queue.push(op.succeedsOrder)
@@ -189,8 +190,8 @@ const branchContainsVersion = (db: DBState, target: number, branch: number[]): b
 
 const compareVersions = (db: DBState, a: RawVersion, b: RawVersion): number => {
   if (a.agent === b.agent) return a.seq - b.seq
-  const aOrder = versionToOrder(db.versionToOrder, a.agent, a.seq)
-  const bOrder = versionToOrder(db.versionToOrder, b.agent, b.seq)
+  const aOrder = versionToOrder(db, a)
+  const bOrder = versionToOrder(db, b)
   assert(aOrder !== bOrder) // Should have returned above in this case.
 
   const [start, target] = aOrder > bOrder ? [aOrder, bOrder] : [bOrder, aOrder]
@@ -283,8 +284,8 @@ const diff = (db: DBState, a: number[], b: number[]) => {
 }
 
 const diffV = (db: DBState, a: RawVersion[], b: RawVersion[]) => {
-  const aOrder = a.map(v => versionToOrder(db.versionToOrder, v.agent, v.seq))
-  const bOrder = b.map(v => versionToOrder(db.versionToOrder, v.agent, v.seq))
+  const aOrder = a.map(v => versionToOrder(db, v))
+  const bOrder = b.map(v => versionToOrder(db, v))
   return diff(db, aOrder, bOrder)
 }
 
@@ -310,6 +311,14 @@ const applyForwards = (db: DBState, op: RawOperation) => {
   // The operation supercedes all the versions named in parents with version.
   let oldV = db.version.get(op.version.agent)
   assert(oldV == null || op.version.seq > oldV, "db already contains inserted operation")
+
+  if (CHECK) {
+    // This is equivalent to the version check below without consulting db.version.
+    const branch = getBranchAsOrders(db)
+    for (const {seq} of op.parents) {
+      assert(branchContainsVersion(db, seq, branch), "Cannot apply operation from the future")
+    }
+  }
 
   for (const {agent, seq} of op.parents) {
     const dbSeq = db.version.get(agent)!
@@ -341,7 +350,7 @@ const applyForwards = (db: DBState, op: RawOperation) => {
     raw: op,
   }
   db.operations[order] = localOp // Appends if necessary.
-  
+
   // *** And apply the named changes to the data model in db.data.
   for (const {key, parents, newValue} of op.docOps) {
     const prevVals = getVal(db, key)
@@ -359,10 +368,9 @@ const applyForwards = (db: DBState, op: RawOperation) => {
     if (CHECK) for (const v of parents) {
       const exists = !!prevVals.find(({version: v2}) => vEq(v, v2))
       if (!exists) {
-        // console.log('Checking ancestry')
-        // We expect one of v2 to dominate v.
-        const ancestry = prevVals.map(({version: v2}) => compareVersions(db, v2, v))
-        assert(ancestry.findIndex(a => a > 0) >= 0)
+        // The named version should be dominated by one of the versions listed now.
+        const branch = prevVals.map(({version: v2}) => versionToOrder(db, v2))
+        assert(branchContainsVersion(db, versionToOrder(db, v), branch))
       }
     }
 
@@ -413,7 +421,7 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
     // console.log('dbseq', dbSeq, 'seq', seq)
     assert(dbSeq == null || dbSeq >= seq, "internal consistency error in versions")
 
-    const parentOrder = versionToOrder(db.versionToOrder, agent, seq)
+    const parentOrder = versionToOrder2(db, agent, seq)
     if (!branchContainsVersion(db, parentOrder, orderBranch)) {
       db.versionFrontier.add(agent)
     }
@@ -571,8 +579,8 @@ const syncPeers = (a: DBState, b: DBState) => {
 
   const getOperationsFrom = (db: DBState, agent: string, seqStart: number, seqEnd: number | null) => {
     const resultOrders: number[] = []
-    let order = versionToOrder(db.versionToOrder, agent, seqStart)
-    let orderEnd = seqEnd == null ? -1 : versionToOrder(db.versionToOrder, agent, seqEnd)
+    let order = versionToOrder2(db, agent, seqStart)
+    let orderEnd = seqEnd == null ? -1 : versionToOrder2(db, agent, seqEnd)
 
     while (order > orderEnd) {
       const op = db.operations[order]
