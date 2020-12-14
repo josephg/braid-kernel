@@ -22,7 +22,7 @@
 
 import {open as lmdbOpen, Database, RootDatabase} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
-import {LocalOperation, RemoteVersion, RemoteOperation, ROOT_VERSION, DocId, DocValue, RemoteValue, LocalDocOp} from './types'
+import {LocalOperation, RemoteVersion, RemoteOperation, ROOT_VERSION, DocId, DocValue, RemoteValue, LocalDocOp, RemoteDocOp} from './types'
 import { getLastKey, keyInc } from './util'
 import assert from 'assert'
 
@@ -32,11 +32,16 @@ if (DEEPCHECK) console.log('running in checked mode')
 
 export type View = Database // I'll probably add more fields here eventually.
 
+export type DocUpdate = {id: DocId, vals: RemoteValue}
+export type OnChange = (view: View, newBranch: RemoteVersion[], ops: DocUpdate[]) => void
+
 export interface Db {
   ops: Database, // All operations ever.
   views: {[k: string]: Database},
 
   _root: RootDatabase
+
+  onChange?: OnChange
 }
 
 const assertType = (db: Database, type: string) => {
@@ -51,7 +56,11 @@ export function openChild(db: Db, name: string, type: string): Database {
   return child
 }
 
-export function open(): Db {
+export interface DbOptions {
+  onChange?: OnChange
+}
+
+export function open(opts: DbOptions = {}): Db {
   const root = lmdbOpen({
     path: 'store',
     keyIsBuffer: true,
@@ -63,7 +72,12 @@ export function open(): Db {
   // And another with a snapshot of the data at some point in time:
   // const data = root.openDB('data', {keyIsBuffer: true})
 
-  return {ops, views: {}, _root: root}
+  return {
+    ops,
+    views: {},
+    _root: root,
+    onChange: opts.onChange
+  }
 }
 
 export function openView(db: Db, viewName: string): Database {
@@ -323,6 +337,8 @@ export function applyForwards(db: Db, view: View, order: number): number[] {
   // exceptions during a transaction.
   view.put(branchKey, newBranch)
 
+  const docUpdates: DocUpdate[] = []
+
   for (const {id, parents, opData} of op.docOps) {
     const prevVals = getVal(view, id)
 
@@ -345,18 +361,27 @@ export function applyForwards(db: Db, view: View, order: number): number[] {
       }
     }
 
-    const newVal: DocValue = [{order, value: opData}]
+    const newVals: DocValue = [{order, value: opData}]
     for (const oldEntry of prevVals) {
       if (!parents.includes(oldEntry.order)) {
         // Keep this.
-        newVal.push(oldEntry)
+        newVals.push(oldEntry)
       }
     }
 
     // If there's multiple conflicting values, we keep them in version-sorted
     // order to make db comparisons easier in the fuzzer.
-    newVal.sort((a, b) => a.order - b.order)
-    view.put(getDocKey(id), newVal)
+    newVals.sort((a, b) => a.order - b.order)
+    view.put(getDocKey(id), newVals)
+
+    // For update notifications
+    docUpdates.push({
+      id, vals: newVals.map(({order, value}) => ({value, version: getRemoteVersion(db, order)}))
+    })
+  }
+
+  if (db.onChange) {
+    db.onChange(view, branchAsRemoteVersions(db, newBranch), docUpdates)
   }
 
   return newBranch
@@ -381,6 +406,8 @@ export function applyBackwards(db: Db, view: View, order: number): number[] {
   }
 
   view.put(branchKey, branch)
+
+  const docUpdates: DocUpdate[] = []
 
   // And update the data.
   for (const {id, parents} of op.docOps) {
@@ -419,6 +446,15 @@ export function applyBackwards(db: Db, view: View, order: number): number[] {
     // This is a bit dirty, to handle the root.
     if (newVals.length === 0) view.remove(getDocKey(id))
     else view.put(getDocKey(id), newVals)
+
+    // For update notifications
+    docUpdates.push({
+      id, vals: newVals.map(({order, value}) => ({value, version: getRemoteVersion(db, order)}))
+    })
+  }
+
+  if (db.onChange) {
+    db.onChange(view, branchAsRemoteVersions(db, branch), docUpdates)
   }
 
   return branch

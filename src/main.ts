@@ -33,7 +33,14 @@ const collections = new Map<string, SchemaInfo>([
 //   agent: -1, seq: 0
 // }
 
-const db = open()
+const db = open({
+  onChange(view, branch, ops) {
+    console.log('onchange now in branch', branch)
+    for (const {id, vals} of ops) {
+      notifySubscriptions(id, vals)
+    }
+  }
+})
 const localInfoDb = openChild(db, 'local', 'local')
 const view = openView(db, 'stuff')
 
