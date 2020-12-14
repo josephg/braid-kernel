@@ -68,7 +68,7 @@ const getOpKey = (order: number | null) => pack(order == null ? 'op' : ['op', or
 const getOrderForVersionKey = (version: RemoteVersion) => pack(['order', version.agent, version.seq])
 
 // *** Document database
-const getDocKey = (id: DocId) => pack(['doc', id.collection, id.key])
+const getDocKey = (id: DocId) => pack(['doc', ...id])
 const branchKey = pack('branch') // Contains a list of orders.
 
 // Get the highest known sequence number for the specified agent. Returns -1 if none found.
@@ -100,11 +100,22 @@ export function getOrder(db: Db, version: RemoteVersion): number {
   return entry as number
 }
 
-const idEq = (a: DocId, b: DocId) => a.collection === b.collection && a.key === b.key
+const idEq = (a: DocId, b: DocId) => (
+  a.length === b.length && a.every((val, i) => b[i] === val)
+)
 
 const branchContainsVersion = (db: Db, target: number, branch: number[], atId?: DocId): boolean => {
   // TODO: Might be worth checking if the target version has the same agent id
   // as one of the items in the branch and short circuiting if so.
+
+  if (DEEPCHECK && atId != null) {
+    // When we're in document mode, all operations named in the branch must
+    // contain an operation modifying the document ID.
+    for (const v of branch) {
+      const op = getOperation(db, v)
+      assert(op.docOps.find(({id}) => idEq(id, atId)) != null)
+    }
+  }
 
   // Order matters between these two lines because of how this is used in applyBackwards.
   if (branch.length === 0) return false
@@ -136,16 +147,21 @@ const branchContainsVersion = (db: Db, target: number, branch: number[], atId?: 
     assert(op != null) // If we hit the root operation, we should have already returned.
 
     if (atId == null) {
+      // We're using operation versions.
       queue.push(...op.parents) // TODO: Could sort in descending order.
+
+      // Ordered so we hit this next. This isn't necessary, the succeeds field
+      // will often be smaller than the parents.
+      if (op.succeeds > -1 && op.parents[0] != op.succeeds) {
+        queue.push(op.succeeds)
+      }
     } else {
-      // We only care about the parents of the named doc operation.
+      // We only care about the operations which modified this key. We'll skip a
+      // lot of operations this way.
       const docOp = op.docOps.find(({id: key}) => idEq(key, atId))
       assert(docOp != null)
       queue.push(...docOp.parents)
     }
-
-    // Ordered so we hit this next.
-    if (op.succeeds > -1) queue.push(op.succeeds)
   }
 
   return found
@@ -366,7 +382,7 @@ const test = async () => {
       parents: [ROOT_VERSION],
       succeedsSeq: -1,
       docOps: [{
-        id: {collection: 'posts', key: 'yo'},
+        id: ['posts', 'yo'],
         parents: [-1],
         opData: {
           title: 'heeey',
@@ -379,7 +395,7 @@ const test = async () => {
   })
   checkOps(db)
   console.log('branch', getBranch(db))
-  console.log(getVal(db, {collection: 'posts', key: 'yo'}))
+  console.log(getVal(db, ['posts', 'yo']))
 
   await db.data.transaction(() => {
     applyBackwards(db, order)
@@ -387,6 +403,6 @@ const test = async () => {
 
   checkOps(db)
   console.log('branch', getBranch(db))
-  console.log(getVal(db, {collection: 'posts', key: 'yo'}))
+  console.log(getVal(db, ['posts', 'yo']))
 }
 test()

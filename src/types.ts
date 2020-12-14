@@ -36,10 +36,10 @@ export interface LocalOperation {
   succeeds: number,
 }
 
-export type DocId = {
-  collection: string,
-  key: string,
-}
+// I'm still not entirely sure the best type to use here. This strikes a
+// reasonable balance in that its easy to map to collection/ID pairs as well as
+// URLs.
+export type DocId = [string, ...string[]]
 
 export interface DocOperation {
   id: DocId,

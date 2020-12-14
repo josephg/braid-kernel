@@ -397,7 +397,7 @@ const applyForwards = (db: DBState, op: RawOperation) => {
  */
 const applyBackwards = (db: DBState, op: RawOperation) => {
   // Version stuff
-  assert(db.version.get(op.version.agent) === op.version.seq)
+  assert(db.version.get(op.version.agent) === op.version.seq) // Should be redundant.
   assert(db.versionFrontier.has(op.version.agent), "Cannot unapply operations in violation of partial order")
 
   if (op.succeedsSeq != null) {
@@ -436,7 +436,6 @@ const applyBackwards = (db: DBState, op: RawOperation) => {
     // - All the objects named in parents that aren't superceded by another
     //   document version
     const newVals = prevVals.filter(({version}) => !vEq(version, op.version))
-    // console.log('prevVals', prevVals.length, newVals.length)
 
     // And add back all the parents that aren't dominated by another value in
     // the operation.
