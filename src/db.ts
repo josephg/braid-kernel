@@ -224,6 +224,10 @@ export function addOperation(db: Db, op: RemoteOperation): number {
   db.ops.put(getOpKey(newOrder), localOp)
   db.ops.put(getOrderForVersionKey(op.version), newOrder)
 
+  // We also store the frontier in the ops store for easy syncing. But this only moves forward!
+  const newBranch = advanceBranchByOp(db, getBranch(db.ops), newOrder, localOp)
+  db.ops.put(branchKey, newBranch)
+
   return newOrder
 }
 
@@ -267,27 +271,30 @@ export function getBranch(view: View): number[] {
   return (view.get(branchKey) as number[]) ?? [-1]
 }
 
+const advanceBranchByOp = (db: Db, branch: number[], order: number, op: LocalOpWithoutOrder) => {
+  // Check the operation fits. The operation should not be in the branch, but
+  // all the operation's parents should be.
+  assert(!branchContainsVersion(db, order, branch), 'db already contains version')
+  for (const parent of op.parents) {
+    assert(branchContainsVersion(db, parent, branch), 'operation in the future')
+  }
+
+  // Every version named in branch is either:
+  // - Equal to a branch in the new operation's parents (in which case remove it)
+  // - Or newer than a branch in the operation's parents (in which case keep it)
+  // If there were any versions which are older, we would have aborted above.
+  return [order,
+    ... branch.filter(o => !op.parents.includes(o))
+  ]
+}
+
 // Returns new branch.
 export function applyForwards(db: Db, view: View, order: number): number[] {
   // This method is often called after addOperation - in which case it might
   // make more sense to take the LocalOperation itself as an argument.
   const op = getOperation(db, order)
-  const oldBranch = getBranch(view)
 
-  // Check the operation fits. The operation should not be in the branch, but
-  // all the operation's parents should be.
-  assert(!branchContainsVersion(db, order, oldBranch), 'db already contains version')
-  for (const parent of op.parents) {
-    assert(branchContainsVersion(db, parent, oldBranch), 'operation in the future')
-  }
-
-  // Every version named in oldBranch is either:
-  // - Equal to a branch in the new operation's parents (in which case remove it)
-  // - Or newer than a branch in the operation's parents (in which case keep it)
-  // If there were any versions which are older, we would have aborted above.
-  const newBranch = [order,
-    ... oldBranch.filter(o => !op.parents.includes(o))
-  ]
+  const newBranch = advanceBranchByOp(db, getBranch(view), order, op)
   // This feels a little fragile because I don't know how lmdb-store handles
   // exceptions during a transaction.
   view.put(branchKey, newBranch)
@@ -397,6 +404,7 @@ const test = async () => {
   const db = open()
   const view = openView(db, 'stuff')
   console.log('branch', getBranch(view))
+  console.log('ops branch', getBranch(db.ops))
 
   const order = await db.ops.transaction(() => {
     const order = addOperation(db, {
@@ -429,5 +437,6 @@ const test = async () => {
   checkOps(db)
   console.log('branch', getBranch(view))
   console.log(getVal(view, ['posts', 'yo']))
+  console.log('ops branch', getBranch(db.ops))
 }
 test()
