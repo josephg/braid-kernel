@@ -68,7 +68,7 @@ const getOpKey = (order: number | null) => pack(order == null ? 'op' : ['op', or
 const getOrderForVersionKey = (version: RemoteVersion) => pack(['order', version.agent, version.seq])
 
 // *** Document database
-const getDocKey = (key: DocId) => pack(['doc', key.collection, key.key])
+const getDocKey = (id: DocId) => pack(['doc', id.collection, id.key])
 const branchKey = pack('branch') // Contains a list of orders.
 
 // Get the highest known sequence number for the specified agent. Returns -1 if none found.
@@ -100,12 +100,15 @@ export function getOrder(db: Db, version: RemoteVersion): number {
   return entry as number
 }
 
-const branchContainsVersion = (db: Db, target: number, branch: number[]): boolean => {
+const idEq = (a: DocId, b: DocId) => a.collection === b.collection && a.key === b.key
+
+const branchContainsVersion = (db: Db, target: number, branch: number[], atId?: DocId): boolean => {
   // TODO: Might be worth checking if the target version has the same agent id
   // as one of the items in the branch and short circuiting if so.
 
-  if (target === -1 || branch.indexOf(target) >= 0) return true
+  // Order matters between these two lines because of how this is used in applyBackwards.
   if (branch.length === 0) return false
+  if (target === -1 || branch.indexOf(target) >= 0) return true
 
   // This works is via a DFS from the operation with a higher localOrder looking
   // for the localOrder of the smaller operation.
@@ -132,7 +135,14 @@ const branchContainsVersion = (db: Db, target: number, branch: number[]): boolea
     const op = getOperation(db, order)
     assert(op != null) // If we hit the root operation, we should have already returned.
 
-    queue.push(...op.parents) // TODO: Could sort in descending order.
+    if (atId == null) {
+      queue.push(...op.parents) // TODO: Could sort in descending order.
+    } else {
+      // We only care about the parents of the named doc operation.
+      const docOp = op.docOps.find(({id: key}) => idEq(key, atId))
+      assert(docOp != null)
+      queue.push(...docOp.parents)
+    }
 
     // Ordered so we hit this next.
     if (op.succeeds > -1) queue.push(op.succeeds)
@@ -239,10 +249,12 @@ export function applyForwards(db: Db, order: number): number[] {
   const newBranch = [order,
     ... oldBranch.filter(o => !op.parents.includes(o))
   ]
+  // This feels a little fragile because I don't know how lmdb-store handles
+  // exceptions during a transaction.
   db.data.put(branchKey, newBranch)
 
-  for (const {key, parents, opData} of op.docOps) {
-    const prevVals = getVal(db, key)
+  for (const {id, parents, opData} of op.docOps) {
+    const prevVals = getVal(db, id)
 
     // The doc op's parents field contains a subset of the versions present in
     // oldVal.
@@ -258,8 +270,8 @@ export function applyForwards(db: Db, order: number): number[] {
       const exists = prevVals.findIndex(({order}) => order === p) >= 0
 
       if (!exists) {
-        const branch = prevVals.map(({order}) => order)
-        assert(branchContainsVersion(db, p, branch))
+        const docBranch = prevVals.map(({order}) => order)
+        assert(branchContainsVersion(db, p, docBranch, id))
       }
     }
 
@@ -274,17 +286,78 @@ export function applyForwards(db: Db, order: number): number[] {
     // If there's multiple conflicting values, we keep them in version-sorted
     // order to make db comparisons easier in the fuzzer.
     newVal.sort((a, b) => a.order - b.order)
-    db.data.put(getDocKey(key), newVal)
+    db.data.put(getDocKey(id), newVal)
   }
 
   return newBranch
 }
 
+export function applyBackwards(db: Db, order: number): number[] {
+  const op = getOperation(db, order)
+  const branch = getBranch(db)
+
+  // Remove the operation from the frontier.
+  const idx = branch.indexOf(order)
+  assert(idx >= 0, 'Can only remove versions from the frontier')
+  branch.splice(idx, 1) // Could do a bag trim, but eh.
+
+  // And add operations from the parents back.
+
+  for (const parent of op.parents) {
+    console.log('bcv', parent, branch, branchContainsVersion(db, parent, branch))
+    if (!branchContainsVersion(db, parent, branch)) {
+      branch.push(parent)
+    }
+  }
+
+  db.data.put(branchKey, branch)
+
+  // And update the data.
+  for (const {id, parents} of op.docOps) {
+    const prevVals = getVal(db, id)
+
+    // The values should instead contain:
+    // - Everything in prevVals not including op.version
+    // - All the objects named in parents that aren't superceded by another
+    //   document version
+
+    // Remove this operation's contribution to the value
+    const newVals = prevVals.filter(({order: docOrder}) => order != docOrder)
+    const docBranch = newVals.map(({order}) => order)
+
+    // And add back all the parents that aren't dominated by another value already.
+    for (const p of parents) {
+      // TODO: Assert p not already represented in prevVals, which would be invalid.
+
+      // If p is dominated by a value in prevVals, skip.
+      if (branchContainsVersion(db, p, docBranch, id)) continue
+      // const dominated = newVals.map(({version}) => compareVersions(db, p, version))
+      // if (dominated.some(x => x < 0)) continue
+
+      if (p === -1) {
+        // If all we have is the root, we'll delete the key.
+        assert(newVals.length === 0)
+      } else {
+        const parentOp = getOperation(db, p)
+        const parentDocOp = parentOp.docOps.find(({id: id2}) => idEq(id, id2))
+        assert(parentDocOp)
+        newVals.push({order: p, value: parentDocOp.opData})
+      }
+    }
+
+    console.log('newVals', newVals)
+    // This is a bit dirty, to handle the root.
+    if (newVals.length === 0) db.data.remove(getDocKey(id))
+    else db.data.put(getDocKey(id), newVals)
+  }
+
+  return branch
+}
 
 const test = async () => {
   const db = open()
   console.log('branch', getBranch(db))
-  await db.ops.transaction(() => {
+  const order = await db.ops.transaction(() => {
     const order = addOperation(db, {
       version: {
         agent: 'hi',
@@ -293,7 +366,7 @@ const test = async () => {
       parents: [ROOT_VERSION],
       succeedsSeq: -1,
       docOps: [{
-        key: {collection: 'posts', key: 'yo'},
+        id: {collection: 'posts', key: 'yo'},
         parents: [-1],
         opData: {
           title: 'heeey',
@@ -302,7 +375,16 @@ const test = async () => {
     })
 
     applyForwards(db, order)
+    return order
   })
+  checkOps(db)
+  console.log('branch', getBranch(db))
+  console.log(getVal(db, {collection: 'posts', key: 'yo'}))
+
+  await db.data.transaction(() => {
+    applyBackwards(db, order)
+  })
+
   checkOps(db)
   console.log('branch', getBranch(db))
   console.log(getVal(db, {collection: 'posts', key: 'yo'}))

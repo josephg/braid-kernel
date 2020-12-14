@@ -17,7 +17,7 @@
     "compression": "^1.7.4",
     "fdb-tuple": "^1.0.0",
     "fresh": "^0.5.2",
-    "lmdb-store": "^0.8.2",
+    "lmdb-store": "^0.9.9",
     "map2": "^1.1.2",
     "ministreamiterator": "^1.0.0",
     "polka": "^0.5.2",

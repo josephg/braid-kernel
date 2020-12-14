@@ -2,7 +2,8 @@
 
 import { TupleItem, pack, unpack } from "fdb-tuple";
 import { Database } from "lmdb-store";
-import { LocalVersion, RemoteVersion, ROOT_VERSION } from "./types"
+import {RemoteVersion} from './types'
+// import { LocalVersion, RemoteVersion, ROOT_VERSION } from "./types"
 
 // Stolen from node-foundationdb.
 export const keyInc = (val: string | Buffer): Buffer => {
@@ -24,13 +25,14 @@ export const keyInc = (val: string | Buffer): Buffer => {
   return result;
 }
 
+// TODO: This might have a bug where if keyInc(prefix) is also a valid key, we
+// return it.
 export const getLastKey = (db: Database, prefix: Buffer): TupleItem[] | null => {
-  const iter = db.getRange({
+  const iter = db.getKeys({
     start: keyInc(prefix),
     end: prefix,
     reverse: true,
     limit: 1,
-    values: false,
   })[Symbol.iterator]()
   const entry = iter.next().value
   // console.log('prefix', prefix, 'entry', entry)
@@ -38,18 +40,18 @@ export const getLastKey = (db: Database, prefix: Buffer): TupleItem[] | null => 
   return entry ? unpack(entry) : null
 }
 
-const ROOT_AGENT = ROOT_VERSION.agent
-export const cmpVersions = (_db: Database, a: LocalVersion, b: LocalVersion): number => {
-  if (a.agent !== ROOT_AGENT && b.agent !== ROOT_AGENT && a.agent !== b.agent) {
-    throw Error('Not implemented')
-  }
+// const ROOT_AGENT = ROOT_VERSION.agent
+// export const cmpVersions = (_db: Database, a: LocalVersion, b: LocalVersion): number => {
+//   if (a.agent !== ROOT_AGENT && b.agent !== ROOT_AGENT && a.agent !== b.agent) {
+//     throw Error('Not implemented')
+//   }
 
-  return a.agent === b.agent ? a.seq - b.seq
-    : a.agent === ROOT_AGENT ? -1
-    : b.agent === ROOT_AGENT ? 1
-    : 0 // Unreachable.
-}
+//   return a.agent === b.agent ? a.seq - b.seq
+//     : a.agent === ROOT_AGENT ? -1
+//     : b.agent === ROOT_AGENT ? 1
+//     : 0 // Unreachable.
+// }
 
 export const encodeVersion = (version: RemoteVersion): string => (
-  pack([version.agentHash, version.seq]).toString('base64')
+  pack([version.agent, version.seq]).toString('base64')
 )
