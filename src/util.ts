@@ -2,7 +2,7 @@
 
 import { TupleItem, pack, unpack } from "fdb-tuple";
 import { Database } from "lmdb-store";
-import {RemoteVersion} from './types'
+import {RemoteValue, RemoteVersion} from './types'
 // import { LocalVersion, RemoteVersion, ROOT_VERSION } from "./types"
 
 // Stolen from node-foundationdb.
@@ -55,3 +55,17 @@ export const getLastKey = (db: Database, prefix: Buffer): TupleItem[] | null => 
 export const encodeVersion = (version: RemoteVersion): string => (
   pack([version.agent, version.seq]).toString('base64')
 )
+
+// This is used to break ties between versions.
+export const vCmp = (a: RemoteVersion, b: RemoteVersion) => (
+  a.agent.localeCompare(b.agent, 'en-US') || (a.seq - b.seq)
+)
+
+export const encodeBranch = (version: RemoteVersion[]): string => (
+  pack(version.sort(vCmp).map(v => [v.agent, v.seq])).toString('base64')
+)
+
+export const splitAndEncode = (val: RemoteValue) => ({
+  version: encodeBranch(val.map(({version}) => version)),
+  data: val.map(({value}) => value) // List of concurrent values
+})

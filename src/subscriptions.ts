@@ -1,8 +1,7 @@
 import asyncstream, { Stream } from 'ministreamiterator'
-import { getAgentHash, getOrCreateAgentId, localToRemoteValue, localToRemoteVersion, newAgentName } from './agent'
-import {SchemaInfo, LocalValue, LocalVersion, NULL_VALUE, RemoteVersion, RemoteValue} from './types'
+import {RemoteValue} from './types'
 import { IncomingMessage, ServerResponse } from 'http'
-import { encodeVersion } from './util'
+import { encodeBranch, encodeVersion, splitAndEncode } from './util'
 
 interface StreamingClient {
   stream: Stream<any>
@@ -20,10 +19,7 @@ const getStreamsForDoc = (parts: string[]): Set<StreamingClient> => {
 }
 
 export const notifySubscriptions = (parts: string[], value: RemoteValue) => {
-  const jsonData = JSON.stringify({
-    version: encodeVersion(value.version),
-    data: value.value // For now all updates are snapshot updates.
-  })
+  const jsonData = JSON.stringify(splitAndEncode(value))
 
   for (const c of getStreamsForDoc(parts)) {
     c.stream.append(jsonData)
@@ -68,8 +64,7 @@ export const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: s
       'content-type': 'application/json',
       'x-patch-type': 'full-snapshot'
     },
-    version: encodeVersion(initialData.version),
-    data: initialData.value
+    ...splitAndEncode(initialData)
   }))
 
   res.once('close', () => {

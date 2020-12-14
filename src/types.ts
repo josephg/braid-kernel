@@ -22,14 +22,14 @@ export interface RemoteOperation {
   parents: RemoteVersion[],
 
   // Unordered set.
-  docOps: DocOperation[]
+  docOps: RemoteDocOp[]
 }
 
 export interface LocalOperation {
   order: number, // Might be always inferrable.
   version: RemoteVersion,
   parents: number[],
-  docOps: DocOperation[],
+  docOps: LocalDocOp[],
 
   // Order of previous version from this agent. Not sure if this is necessary.
   // -1 if none.
@@ -41,10 +41,14 @@ export interface LocalOperation {
 // URLs.
 export type DocId = [string, ...string[]]
 
-export interface DocOperation {
+export interface LocalDocOp {
   id: DocId,
   parents: number[], // Specific to the document.
   opData: any, // This is usually the new value.
+}
+
+export type RemoteDocOp = Omit<LocalDocOp, 'parents'> & {
+  parents: RemoteVersion[]
 }
 
 export type DocValueStoreAll = {
@@ -53,7 +57,10 @@ export type DocValueStoreAll = {
 }[]
 export type DocValue = DocValueStoreAll // | DocValueLWW | ...
 
-
+export type RemoteValue = {
+  version: RemoteVersion,
+  value: any
+}[]
 
 // Alright - some fixed agent IDs:
 // -1: Transient (these IDs will never appear
@@ -70,10 +77,10 @@ export const ROOT_VERSION: RemoteVersion = {
 
 
 
-// export interface SchemaInfo {
-//   // Type
-//   // Conflict behaviour
-//   // Is this writable?
-//   // Is this a computed index or view?
-//   // ...
-// }
+export interface SchemaInfo {
+  // Type
+  // Conflict behaviour
+  // Is this writable?
+  // Is this a computed index or view?
+  // ...
+}

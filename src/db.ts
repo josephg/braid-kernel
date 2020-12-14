@@ -22,7 +22,7 @@
 
 import {open as lmdbOpen, Database, RootDatabase} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
-import {LocalOperation, RemoteVersion, RemoteOperation, ROOT_VERSION, DocId, DocValue} from './types'
+import {LocalOperation, RemoteVersion, RemoteOperation, ROOT_VERSION, DocId, DocValue, RemoteValue, LocalDocOp} from './types'
 import { getLastKey, keyInc } from './util'
 import assert from 'assert'
 
@@ -45,6 +45,12 @@ const assertType = (db: Database, type: string) => {
   else assert.strictEqual(actualType, type)
 }
 
+export function openChild(db: Db, name: string, type: string): Database {
+  const child = db._root.openDB(name, {keyIsBuffer: true})
+  assertType(child, type)
+  return child
+}
+
 export function open(): Db {
   const root = lmdbOpen({
     path: 'store',
@@ -64,9 +70,8 @@ export function openView(db: Db, viewName: string): Database {
   if (db.views[viewName] != null) return db.views[viewName]
   else {
     assert(viewName != 'ops', 'Reserved view name')
-    const view = db._root.openDB(viewName, {keyIsBuffer: true})
-    assertType(view, 'view')
 
+    const view = openChild(db, viewName, 'view')
     db.views[viewName] = view
     return view
   }
@@ -95,7 +100,7 @@ const branchKey = pack('branch') // Contains a list of orders.
 const typeKey = pack('db type')
 
 // Get the highest known sequence number for the specified agent. Returns -1 if none found.
-const getMaxSeq = (db: Db, agent: string): number | null => {
+export function getMaxSeq(db: Db, agent: string): number | null {
   const key = getLastKey(db.ops, pack(['order', agent]))
   console.log('getMaxSeq for agent', agent, 'is', key)
   if (key == null) return null
@@ -121,6 +126,11 @@ export function getOrder(db: Db, version: RemoteVersion): number {
   const entry = db.ops.get(getOrderForVersionKey(version))
   assert(entry != null)
   return entry as number
+}
+
+// This is just used so frequently.
+export function getRemoteVersion(db: Db, order: number): RemoteVersion {
+  return order === -1 ? ROOT_VERSION : getOperation(db, order).version
 }
 
 const idEq = (a: DocId, b: DocId) => (
@@ -212,7 +222,9 @@ export function addOperation(db: Db, op: RemoteOperation): number {
   const localOp: LocalOpWithoutOrder = {
     version: op.version,
     // order: newOrder,
-    docOps: op.docOps,
+    docOps: op.docOps.map(({id, parents, opData}): LocalDocOp => ({
+      id, opData, parents: parents.map(version => getOrder(db, version))
+    })),
     parents: op.parents.map(v => getOrder(db, v)),
     succeeds: op.succeedsSeq === -1 ? -1
     : getOrder(db, {agent: op.version.agent, seq: op.succeedsSeq})
@@ -267,8 +279,20 @@ export function getVal(view: View, key: DocId): DocValue {
   }]
 }
 
+export function getRemoteVal(db: Db, view: View, key: DocId): RemoteValue {
+  const val = getVal(view, key)
+  return val.map(({order, value}) => ({
+    version: getRemoteVersion(db, order),
+    value
+  }))
+}
+
 export function getBranch(view: View): number[] {
   return (view.get(branchKey) as number[]) ?? [-1]
+}
+
+export function branchAsRemoteVersions(db: Db, branch: number[]): RemoteVersion[] {
+  return branch.map(order => getRemoteVersion(db, order))
 }
 
 const advanceBranchByOp = (db: Db, branch: number[], order: number, op: LocalOpWithoutOrder) => {
@@ -416,7 +440,7 @@ const test = async () => {
       succeedsSeq: -1,
       docOps: [{
         id: ['posts', 'yo'],
-        parents: [-1],
+        parents: [ROOT_VERSION],
         opData: {
           title: 'heeey',
         }
@@ -439,4 +463,7 @@ const test = async () => {
   console.log(getVal(view, ['posts', 'yo']))
   console.log('ops branch', getBranch(db.ops))
 }
-test()
+
+if (require.main === module) {
+  test()
+}

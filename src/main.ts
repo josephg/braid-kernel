@@ -1,22 +1,17 @@
 import polka from 'polka'
-import {open} from 'lmdb-store'
 import {pack, unpack} from 'fdb-tuple'
-import { getAgentHash, getOrCreateAgentId, localToRemoteValue, localToRemoteVersion, newAgentName } from './agent'
-import {SchemaInfo, LocalValue, LocalVersion, NULL_VALUE, RemoteVersion} from './types'
+import { DocId, LocalOperation, RemoteOperation, RemoteValue, RemoteVersion, SchemaInfo } from './types'
 import bodyParser from 'body-parser'
-import {keyInc, getLastKey, encodeVersion} from './util'
+import {keyInc, getLastKey, encodeVersion, splitAndEncode, encodeBranch} from './util'
 import fresh from 'fresh'
 import compress from 'compression'
 import sirv from 'sirv'
 import { IncomingMessage, ServerResponse } from 'http'
 import { getSSE, notifySubscriptions } from './subscriptions'
+import { addOperation, applyForwards, branchAsRemoteVersions, getBranch, getMaxSeq, getOrder, getRemoteVal, getVal, open, openChild, openView } from './db'
+import { newAgentName } from './agent'
 
 const PORT = process.env.PORT || 4040
-
-const db = open({
-  path: 'store',
-  keyIsBuffer: true,
-})
 
 // Internal data:
 // - Set of schemas
@@ -34,25 +29,24 @@ const collections = new Map<string, SchemaInfo>([
 ])
 
 // The local transient version should never be saved in the database.
-export const transient_version: LocalVersion = {
-  agent: -1, seq: 0
-}
+// export const transient_version: LocalVersion = {
+//   agent: -1, seq: 0
+// }
 
-let localAgentHash = db.get(pack('_localagent'))
+const db = open()
+const localInfoDb = openChild(db, 'local', 'local')
+const view = openView(db, 'stuff')
+
+
+let localAgentHash = localInfoDb.get(pack('_localagent'))
 if (localAgentHash == null) {
   localAgentHash = newAgentName()
   console.log('made new local agent hash', localAgentHash)
-  db.put(pack('_localagent'), localAgentHash)
+  localInfoDb.put(pack('_localagent'), localAgentHash)
 }
-let localAgent = getOrCreateAgentId(db, localAgentHash)
+// let localAgent = getOrCreateAgentId(localInfoDb, localAgentHash)
 
-console.log('localagent', localAgent, localAgentHash)
-
-const opKey = (agent: number, seq?: number): Buffer => (
-  pack(seq == null ? ['_op', agent] : ['_op', agent, seq])
-)
-
-const docKey = (collection: string, key: string): Buffer => pack([collection, key])
+// console.log('localagent', localAgent, localAgentHash)
 
 
 const urlToParts = (urlpath: string): string[] => {
@@ -65,83 +59,108 @@ const urlToParts = (urlpath: string): string[] => {
   return parts
 }
 
-const getDb = (parts: string[]): LocalValue | null => {
-  if (parts.length !== 2) return null // always /collection/key
-
-  const [collectionName, key] = parts
-  const schema = collections.get(collectionName)
-  if (schema == null) return null
-
+const getDb = (id: DocId): RemoteValue => {
   // lmdb-store can fetch data synchronously. I'll want to relax this at some
   // point but its dang convenient.
 
   // Also at some point use the fdb subspace code to compact subspace prefixes
-  return db.get(docKey(collectionName, key)) as LocalValue ?? NULL_VALUE
+  // return db.get(docKey(collectionName, key)) as LocalValue ?? NULL_VALUE
+  return getRemoteVal(db, view, id)
 }
 
-const getLastVersion = (id: number): number => {
-  const lastKey = getLastKey(db, opKey(id))
-  // console.log('lastkey', lastKey)
-  return lastKey == null ? -1 : lastKey[lastKey.length - 1] as number
-}
+// const getLastVersion = (id: number): number => {
+//   const lastKey = getLastKey(db, opKey(id))
+//   // console.log('lastkey', lastKey)
+//   return lastKey == null ? -1 : lastKey[lastKey.length - 1] as number
+// }
 
 
-interface DbTransactionEntry {
-  collection: string,
-  key: string,
-  replaces: LocalVersion,
-  value: any // soon: a reversible operation.
-}
+// interface DbTransactionEntry {
+//   collection: string,
+//   key: string,
+//   replaces: LocalVersion,
+//   value: any // soon: a reversible operation.
+// }
 
-const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => {
-  // TODO: Handle multiple objects being set at once
-  // TODO: Handle conflicts
-  // TODO: Handle differential updates
-  if (parts.length !== 2) return null
-  const [collectionName, key] = parts
-  const schema = collections.get(collectionName)
-  if (schema == null) return null
+// const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => {
+//   // TODO: Handle multiple objects being set at once
+//   // TODO: Handle conflicts
+//   // TODO: Handle differential updates
+//   if (parts.length !== 2) return null
+//   const [collectionName, key] = parts
+//   const schema = collections.get(collectionName)
+//   if (schema == null) return null
 
-  return db.transaction(async () => {
-    const newSeq = getLastVersion(localAgent) + 1
-    const version: LocalVersion = {
-      agent: localAgent,
-      seq: newSeq
+//   return db.transaction(async () => {
+//     const newSeq = getLastVersion(localAgent) + 1
+//     const version: LocalVersion = {
+//       agent: localAgent,
+//       seq: newSeq
+//     }
+//     const value: LocalValue = {
+//       value: docValue,
+//       version
+//     }
+
+//     const dbKey = docKey(collectionName, key)
+//     const oldVersion = db.get(dbKey) ?? NULL_VALUE
+//     await db.put(dbKey, value)
+//     // console.log('put', opKey(localAgent, newSeq))
+//     await db.put(opKey(localAgent, newSeq), [
+//       // The transaction is a list of written values.
+//       {
+//         collection: collectionName,
+//         key,
+//         replaces: oldVersion,
+//         value: docValue,
+//       }
+//       // Do we need anything else here? Probably...
+//     ])
+
+//     // Notify listeners
+//     notifySubscriptions(parts, localToRemoteValue(db, value))
+
+//     return version
+//   })
+// }
+
+const putDb = async (id: DocId, docValue: any, docParents?: RemoteVersion[]): Promise<RemoteVersion> => {
+  return await db.ops.transaction(() => {
+    const oldVersion = getMaxSeq(db, localAgentHash) ?? -1
+    const version: RemoteVersion = {
+      agent: localAgentHash,
+      seq: oldVersion + 1
     }
-    const value: LocalValue = {
-      value: docValue,
-      version
+    const branch = getBranch(view)
+
+    if (docParents == null) {
+      docParents = getRemoteVal(db, view, id).map(({version}) => version)
     }
 
-    const dbKey = docKey(collectionName, key)
-    const oldVersion = db.get(dbKey) ?? NULL_VALUE
-    await db.put(dbKey, value)
-    // console.log('put', opKey(localAgent, newSeq))
-    await db.put(opKey(localAgent, newSeq), [
-      // The transaction is a list of written values.
-      {
-        collection: collectionName,
-        key,
-        replaces: oldVersion,
-        value: docValue,
-      }
-      // Do we need anything else here? Probably...
-    ])
+    const op: RemoteOperation = {
+      version,
+      parents: branchAsRemoteVersions(db, branch),
+      succeedsSeq: oldVersion,
+      docOps: [{
+        id: id,
+        opData: docValue,
+        parents: docParents,
+      }]
+    }
 
-    // Notify listeners
-    notifySubscriptions(parts, localToRemoteValue(db, value))
-
+    const order = addOperation(db, op)
+    applyForwards(db, view, order)
     return version
   })
 }
 
-const getInternal = (parts: string[]): LocalValue | null => {
-  // console.log('internal', parts)
-  switch (parts[0]) {
-    case '_status': return { version: transient_version, value: 'ok' }
-    default: return NULL_VALUE
-  }
-}
+// const getInternal = (parts: string[]): LocalValue | null => {
+//   // console.log('internal', parts)
+//   switch (parts[0]) {
+//     case '_status': return { version: transient_version, value: 'ok' }
+//     default: return NULL_VALUE
+//   }
+// }
 
 const notFound = (res: ServerResponse) => {
   res.statusCode = 404
@@ -159,29 +178,31 @@ app.use(compress(), sirv(__dirname + '/../public', {
 
 app.use('/raw', (req, res, next) => {
   // const path = req.path.slice(1) // Slice off the 
-  const parts = urlToParts(req.path)
-  if (parts.length < 1) return notFound(res)
+  const docId = urlToParts(req.path)
+  if (docId.length < 1) return notFound(res)
 
-  ;(req as any).parts = parts
+  ;(req as any).docId = docId
   next()
 })
 
 app.get('/raw/*', (req, res) => {
-  const parts = (req as any).parts
-  // console.log('get parts', parts)
-  const data = parts[0][0] === '_' ? getInternal(parts) : getDb(parts)
+  const docId = (req as any).docId
+  // console.log('get docId', docId)
+  // const data = docId[0][0] === '_' ? getInternal(docId) : getDb(docId)
+  const remoteValue = getDb(docId)
 
-  const remoteValue = localToRemoteValue(db, data ?? NULL_VALUE)
-
-  if (req.headers['accept'] === 'text/event-stream') return getSSE(req, res, parts, remoteValue)
+  if (req.headers['accept'] === 'text/event-stream') return getSSE(req, res, docId, remoteValue)
   // console.log('data', data)
-  if (data == null) return notFound(res)
-  
+  // if (data == null) return notFound(res)
+
   // const remoteVersion = localToRemoteVersion(db, data.version)
+
+  const {data, version} = splitAndEncode(remoteValue)
+
   const resHeaders = {
     'content-type': 'application/json',
-    etag: encodeVersion(remoteValue.version),
-    'x-version': encodeVersion(remoteValue.version),
+    etag: version,
+    'x-version': version,
   }
   if (fresh(req.headers, resHeaders)) {
     res.writeHead(304, resHeaders)
@@ -189,31 +210,30 @@ app.get('/raw/*', (req, res) => {
   } else {
     res.writeHead(200, resHeaders)
     // res.write(JSON.stringify(data.value))
-    res.end(JSON.stringify(remoteValue))
+    res.end(JSON.stringify(data))
   }
 })
 
 app.put('/raw/*', bodyParser.json(), async (req, res) => {
-  const parts = (req as any).parts
-  if (parts[0][0] === '_') return notFound(res)
+  const docId = (req as any).docId as DocId
+  // if (parts[0][0] === '_') return notFound(res)
 
   // For now we'll use the local version, but clients should also be able to
   // set their own version.
   //
   // And clients should be able to specify the version that this document is
   // replacing - to trigger conflict behaviour.
-  const versionP = putDb(parts, req.body)
+  const versionP = putDb(docId, req.body)
   if (versionP == null) return notFound(res)
 
-  const localVersion = await versionP
-  const remoteVersion = localToRemoteVersion(db, localVersion)
+  const remoteVersion = await versionP
   res.setHeader('x-version', encodeVersion(remoteVersion))
-  
+
   // TEMPORARY. I'm not actually sure what data to return in the body here.
   // Maybe the version is as good as any.
   res.setHeader('content-type', 'application/json')
   res.write(JSON.stringify(remoteVersion))
-  
+
   res.end()
 })
 
