@@ -722,7 +722,7 @@ const test = () => {
       assertDbEq(a, b)
       checkDb(a)
       checkDb(b)
-      
+
       const mergeHead = getBranch(a)
 
       // console.log('merge', mergeHead, aHead, bHead)

@@ -1,5 +1,5 @@
 import asyncstream, { Stream } from 'ministreamiterator'
-import {RemoteValue} from './types'
+import {DocId, RemoteValue} from './types'
 import { IncomingMessage, ServerResponse } from 'http'
 import { encodeBranch, encodeVersion, splitAndEncode } from './util'
 
@@ -8,8 +8,8 @@ interface StreamingClient {
 }
 const streamsForDocs = new Map<string, Set<StreamingClient>>()
 
-const getStreamsForDoc = (parts: string[]): Set<StreamingClient> => {
-  const k = parts.join('/')
+const getStreamsForDoc = (id: DocId): Set<StreamingClient> => {
+  const k = id.join('/')
   let set = streamsForDocs.get(k)
   if (set == null) {
     set = new Set()
@@ -18,10 +18,10 @@ const getStreamsForDoc = (parts: string[]): Set<StreamingClient> => {
   return set
 }
 
-export const notifySubscriptions = (parts: string[], value: RemoteValue) => {
+export const notifySubscriptions = (id: DocId, value: RemoteValue) => {
   const jsonData = JSON.stringify(splitAndEncode(value))
 
-  for (const c of getStreamsForDoc(parts)) {
+  for (const c of getStreamsForDoc(id)) {
     c.stream.append(jsonData)
   }
 }
@@ -30,7 +30,7 @@ const tryFlush = (res: ServerResponse) => {
   ;(res as any).flush && (res as any).flush()
 }
 
-export const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: string[], initialData: RemoteValue) => {
+export const getSSE = async (req: IncomingMessage, res: ServerResponse, id: DocId, initialData: RemoteValue) => {
   console.log('get sse')
   // There's 3 cases here:
   // - The client did not request a version. Send the document then stream updates.
@@ -54,7 +54,7 @@ export const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: s
   const client = {
     stream,
   }
-  const docStreams = getStreamsForDoc(parts)
+  const docStreams = getStreamsForDoc(id)
   docStreams.add(client)
 
   // The initial message says some things about the data
@@ -68,7 +68,7 @@ export const getSSE = async (req: IncomingMessage, res: ServerResponse, parts: s
   }))
 
   res.once('close', () => {
-    console.log('Closed connection to client for doc', parts)
+    console.log('Closed connection to client for doc', id)
     connected = false
     stream.end()
     docStreams.delete(client)

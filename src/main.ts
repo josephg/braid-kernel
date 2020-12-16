@@ -39,6 +39,9 @@ const db = open({
     for (const {id, vals} of ops) {
       notifySubscriptions(id, vals)
     }
+
+    // Super gross. Figure out a better way to do this.
+    notifySubscriptions(['_branch'], [{value: branch, version: branch[0]}])
   }
 })
 const localInfoDb = openChild(db, 'local', 'local')
@@ -74,62 +77,6 @@ const getDb = (id: DocId): RemoteValue => {
   // return db.get(docKey(collectionName, key)) as LocalValue ?? NULL_VALUE
   return getRemoteVal(db, view, id)
 }
-
-// const getLastVersion = (id: number): number => {
-//   const lastKey = getLastKey(db, opKey(id))
-//   // console.log('lastkey', lastKey)
-//   return lastKey == null ? -1 : lastKey[lastKey.length - 1] as number
-// }
-
-
-// interface DbTransactionEntry {
-//   collection: string,
-//   key: string,
-//   replaces: LocalVersion,
-//   value: any // soon: a reversible operation.
-// }
-
-// const putDb = (parts: string[], docValue: any): Promise<LocalVersion> | null => {
-//   // TODO: Handle multiple objects being set at once
-//   // TODO: Handle conflicts
-//   // TODO: Handle differential updates
-//   if (parts.length !== 2) return null
-//   const [collectionName, key] = parts
-//   const schema = collections.get(collectionName)
-//   if (schema == null) return null
-
-//   return db.transaction(async () => {
-//     const newSeq = getLastVersion(localAgent) + 1
-//     const version: LocalVersion = {
-//       agent: localAgent,
-//       seq: newSeq
-//     }
-//     const value: LocalValue = {
-//       value: docValue,
-//       version
-//     }
-
-//     const dbKey = docKey(collectionName, key)
-//     const oldVersion = db.get(dbKey) ?? NULL_VALUE
-//     await db.put(dbKey, value)
-//     // console.log('put', opKey(localAgent, newSeq))
-//     await db.put(opKey(localAgent, newSeq), [
-//       // The transaction is a list of written values.
-//       {
-//         collection: collectionName,
-//         key,
-//         replaces: oldVersion,
-//         value: docValue,
-//       }
-//       // Do we need anything else here? Probably...
-//     ])
-
-//     // Notify listeners
-//     notifySubscriptions(parts, localToRemoteValue(db, value))
-
-//     return version
-//   })
-// }
 
 const putDb = async (id: DocId, docValue: any, docParents?: RemoteVersion[]): Promise<RemoteVersion> => {
   return await db.ops.transaction(() => {
@@ -244,7 +191,7 @@ app.put('/raw/*', bodyParser.json(), async (req, res) => {
   res.end()
 })
 
-
+// app.post('/setversion'
 
 app.listen(PORT, (err?: Error) => {
   if (err) throw err
