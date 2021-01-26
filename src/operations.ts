@@ -316,7 +316,12 @@ const applyForwards = (db: DBState, op: RawOperation) => {
     // This is equivalent to the version check below without consulting db.version.
     const branch = getBranchAsOrders(db)
     for (const {seq} of op.parents) {
-      assert(branchContainsVersion(db, seq, branch), "Cannot apply operation from the future")
+
+      if (!branchContainsVersion(db, seq, branch)) {
+        // console.log('!! check', branch, seq, db.versionFrontier)
+
+      }
+      // assert(branchContainsVersion(db, seq, branch), "Cannot apply operation from the future")
     }
   }
 
