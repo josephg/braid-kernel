@@ -1,5 +1,11 @@
 # Braid kernel prototype
 
+> PROJECT MOVING
+
+This project is moving to [braid-db](https://github.com/josephg/braid-db) as part of a rewrite to rust. This repository will stay here for reference, but I will not continue to work on it.
+
+---
+
 This is a simple prototype / experiment in database design.
 
 The goal is to have a small, simple database with the following properties:
